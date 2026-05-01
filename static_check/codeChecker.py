@@ -101,7 +101,7 @@ class LoopLocator(c_ast.NodeVisitor):
         # Capture the first while encountered (the problem guarantees a single loop)
         if self.target_loop is None:
             self.target_loop = node
-            print("[DEBUG] ✅ Captured the first while loop node (program contains only a single loop)")
+            print("[DEBUG] Captured the first while loop node (program contains only a single loop)")
         # Regardless of capture, skip traversing the loop body (saves overhead and avoids nested interference)
         return  # do not call generic_visit
     def visit_For(self, node):
@@ -114,11 +114,9 @@ class LoopLocator(c_ast.NodeVisitor):
 
 # ==================== Core Checking Logic ====================
 def split_loop_body(loop_node):
-    # 1. 提取循环体中的语句列表
     if isinstance(loop_node.stmt, c_ast.Compound):
         body_stmts = loop_node.stmt.block_items or []
     else:
-        # 循环体可能是单条语句（极少见，但处理更健壮）
         body_stmts = [loop_node.stmt] if loop_node.stmt else []
 
     begin_part, end_part = [], []
@@ -137,7 +135,6 @@ def split_loop_body(loop_node):
             in_begin = False
             end_part.append(stmt)
 
-    # 2. 若为 for 循环，将迭代表达式追加到 end_part（作为循环体末尾的更新语句）
     if isinstance(loop_node, c_ast.For) and loop_node.next:
         end_part.append(loop_node.next)
 
@@ -232,8 +229,8 @@ def preprocess_c_code(c_code):
 def check_rank_consistency(c_code, guard_input = "", verbose=False):
     # ============ [Core change] Completely ignore guard_input, directly locate the only loop ============
     print("="*60)
-    print("🔍 Starting rank consistency check | Strategy: locate the first while loop in the program (single loop)")
-    print(f"[INFO] ℹ️  Ignoring guard parameter: '{guard_input}' (program contains only one while loop)")
+    print(" Starting rank consistency check | Strategy: locate the first while loop in the program (single loop)")
+    print(f"[INFO]  Ignoring guard parameter: '{guard_input}' (program contains only one while loop)")
     print("="*60)
     
     # Preprocess
@@ -256,7 +253,7 @@ def check_rank_consistency(c_code, guard_input = "", verbose=False):
     loop_node = locator.get_loop()
     
     if loop_node is None:
-        print("[ERROR] ❌ No while loop node found")
+        print("[ERROR] No while loop node found")
         return 5, "No while loop exists in AST (please confirm the code contains a loop structure)"
     print("[DEBUG] ✓ Successfully located target loop node")
     # ======================================================================
@@ -272,7 +269,7 @@ def check_rank_consistency(c_code, guard_input = "", verbose=False):
     print(f"  old_rank variables ({len(old_ranks)}): {[n for n,_ in old_ranks]}")
     print(f"  new_rank variables ({len(new_ranks)}): {list(extractor.new_ranks_init.keys())}")
     if len(old_ranks) == 0 and len(new_ranks) == 0:
-        print("[ERROR] ❌ No rank variables (old_rank / new_rank) found in the program.")
+        print("[ERROR] No rank variables (old_rank / new_rank) found in the program.")
         return 2, {
             'inf': "Missing required rank variable declarations. Expected at least one old_rank and one new_rank variable."
         }
@@ -312,7 +309,7 @@ def check_rank_consistency(c_code, guard_input = "", verbose=False):
         print("[✓] Update expression consistency check passed")
     
     print("\n" + "="*60)
-    print("✅ All checks passed! Rank update logic conforms to verification specification")
+    print(" All checks passed! Rank update logic conforms to verification specification")
     print("="*60)
     return 1, {'count': len(old_ranks)}
 
@@ -351,21 +348,21 @@ Note: The guard parameter is completely ignored in batch mode because the progra
     
     # Validate directory existence
     if not os.path.exists(args.dir_path):
-        print(f"❌ Error: Path '{args.dir_path}' does not exist", file=sys.stderr)
+        print(f" Error: Path '{args.dir_path}' does not exist", file=sys.stderr)
         sys.exit(11)
     if not os.path.isdir(args.dir_path):
-        print(f"❌ Error: '{args.dir_path}' is not a directory", file=sys.stderr)
+        print(f" Error: '{args.dir_path}' is not a directory", file=sys.stderr)
         sys.exit(12)
     
     # Get list of C files
     try:
         c_files = get_c_files(args.dir_path)
     except Exception as e:
-        print(f"❌ Directory scan failed: {e}", file=sys.stderr)
+        print(f" Directory scan failed: {e}", file=sys.stderr)
         sys.exit(13)
     
     if not c_files:
-        print(f"⚠️  Warning: No .c files found in directory '{args.dir_path}'")
+        print(f"  Warning: No .c files found in directory '{args.dir_path}'")
         sys.exit(0)
     
     print(f"📁 Scanning directory: {os.path.abspath(args.dir_path)}")
@@ -374,30 +371,30 @@ Note: The guard parameter is completely ignored in batch mode because the progra
     # Result storage: [(filename, status, details)]
     results = []
     STATUS_MSG = {
-        1: ("✅ PASS", "All rank variable update logic conforms to specification"),
-        2: ("❌ Variable count mismatch", "old_rank and new_rank counts are inconsistent"),
-        3: ("❌ Loop start assignment error", "old_rank did not correctly preserve previous new_rank value"),
-        4: ("❌ Update expression inconsistency", "new_rank update logic inside loop does not match initialization"),
-        5: ("❌ Target loop not found", "No while loop exists in AST"),
-        6: ("❌ AST parsing failed", "C code syntax error or contains unsupported syntax"),
-        10: ("❌ File read failure", "Cannot read source file")
+        1: (" PASS", "All rank variable update logic conforms to specification"),
+        2: (" Variable count mismatch", "old_rank and new_rank counts are inconsistent"),
+        3: (" Loop start assignment error", "old_rank did not correctly preserve previous new_rank value"),
+        4: (" Update expression inconsistency", "new_rank update logic inside loop does not match initialization"),
+        5: (" Target loop not found", "No while loop exists in AST"),
+        6: (" AST parsing failed", "C code syntax error or contains unsupported syntax"),
+        10: (" File read failure", "Cannot read source file")
     }
     
     # Analyze each file
     for idx, filename in enumerate(c_files, 1):
         filepath = os.path.join(args.dir_path, filename)
         print(f"\n{'='*70}")
-        print(f"🔍 [{idx}/{len(c_files)}] Analyzing: {filename}")
+        print(f" [{idx}/{len(c_files)}] Analyzing: {filename}")
         print(f"{'='*70}")
         
         # Read file content
         try:
             with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
                 c_code = f.read()
-            print(f"📄 File size: {len(c_code)} characters")
+            print(f" File size: {len(c_code)} characters")
         except Exception as e:
             err_msg = f"File read exception: {str(e)}"
-            print(f"❌ {err_msg}")
+            print(f" {err_msg}")
             results.append((filename, 10, err_msg))
             continue
         
@@ -406,13 +403,13 @@ Note: The guard parameter is completely ignored in batch mode because the progra
             status, details = check_rank_consistency(c_code, args.guard, verbose=args.verbose)
         except Exception as e:
             status, details = 7, f"Check process exception: {str(e)}"
-            print(f"⚠️  Unexpected error during check: {e}")
+            print(f"  Unexpected error during check: {e}")
         
         results.append((filename, status, details))
     
     # ===== Generate summary report =====
     print("\n" + "="*70)
-    print("📊 Batch Check Summary Report")
+    print(" Batch Check Summary Report")
     print("="*70)
     
     # Group by status
@@ -425,23 +422,23 @@ Note: The guard parameter is completely ignored in batch mode because the progra
     passed = len(stats[1])
     failed = total - passed
     
-    print(f"\n✅ PASS: {passed} files")
+    print(f"\n PASS: {passed} files")
     if stats[1]:
         for f in stats[1]:
             print(f"   • {f}")
     
-    print(f"\n❌ FAIL: {failed} files")
+    print(f"\n FAIL: {failed} files")
     for status_code in sorted(stats.keys()):
         if status_code == 1 or not stats[status_code]:  # skip PASS and empty entries
             continue
-        symbol, desc = STATUS_MSG.get(status_code, ("⚠️", "Unknown error"))
+        symbol, desc = STATUS_MSG.get(status_code, ("", "Unknown error"))
         print(f"\n{symbol} {desc} ({len(stats[status_code])} files):")
         for f in stats[status_code]:
             print(f"   • {f}")
     
     # Final statistics
     print("\n" + "="*70)
-    print(f"📈 Total: {total} files | PASS: {passed} | FAIL: {failed}")
+    print(f" Total: {total} files | PASS: {passed} | FAIL: {failed}")
     print("="*70)
     
     # Exit code: 0 if all passed, 1 if any failed
@@ -452,7 +449,7 @@ if __name__ == '__main__':
     try:
         import pycparser
     except ImportError:
-        print("❌ Missing dependency: please install pycparser", file=sys.stderr)
+        print(" Missing dependency: please install pycparser", file=sys.stderr)
         print("   Run: pip install pycparser", file=sys.stderr)
         sys.exit(1)
     main()

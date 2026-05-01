@@ -4,25 +4,18 @@ import sys
 import clang
 from clang.cindex import Index, CursorKind
 def parse_file(filename):
-    """解析C文件，返回翻译单元的游标"""
     index = Index.create()
 
-    tu = index.parse(filename, args=["-std=c99"])  # 可根据需要调整标准
+    tu = index.parse(filename, args=["-std=c99"])  
     if not tu:
         raise RuntimeError(f"Failed to parse {filename}")
-    # 打印诊断信息（可选）
     for diag in tu.diagnostics:
         print(diag)
     return tu.cursor
 def get_cursor_signature(cursor):
-    """
-    获取游标的签名，用于比较节点的关键属性。
-    对 TRANSLATION_UNIT 节点忽略文件名（spelling）和类型。
-    """
     parts = [str(cursor.kind)]
 
     if cursor.kind != CursorKind.TRANSLATION_UNIT:
-        # 对整型常量，使用 token 方式获取数值
         if cursor.kind == CursorKind.INTEGER_LITERAL:
             tokens = list(cursor.get_tokens())
             if tokens:
@@ -42,14 +35,10 @@ def compare_cursors(c1, c2):
     if c1.kind != c2.kind:
         return False, f"Kind mismatch: {c1.kind} vs {c2.kind}"
 
-    # ------------------------------------------------------------
-    # 特殊处理：COMPOUND_STMT（函数体）允许一方末尾多一个 return 0;
-    # ------------------------------------------------------------
     if c1.kind == CursorKind.COMPOUND_STMT and c2.kind == CursorKind.COMPOUND_STMT:
         children1 = list(c1.get_children())
         children2 = list(c2.get_children())
 
-        # 辅助函数：判断一个游标是不是 return 0;
         def is_return_zero(cursor):
             if cursor.kind != CursorKind.RETURN_STMT:
                 return False
@@ -64,14 +53,12 @@ def compare_cursors(c1, c2):
                 return False
             return tokens[0].spelling == '0'
 
-        # 若 children1 末尾不是 return 0，而 children2 末尾是 return 0，则从 children2 中去掉它
         if children1 and children2:
             if not is_return_zero(children1[-1]) and is_return_zero(children2[-1]):
                 children2 = children2[:-1]
             elif is_return_zero(children1[-1]) and not is_return_zero(children2[-1]):
                 children1 = children1[:-1]
 
-        # 比较调整后的子节点
         if len(children1) != len(children2):
             return False, f"Children count mismatch after return adjustment: {len(children1)} vs {len(children2)}"
 
@@ -81,9 +68,6 @@ def compare_cursors(c1, c2):
                 return False, f"Child {i} mismatch: {msg}"
         return True, "ASTs are identical (adjusted for return 0)"
 
-    # ------------------------------------------------------------
-    # 原有逻辑：非 COMPOUND_STMT 节点继续使用签名比较
-    # ------------------------------------------------------------
     sig1 = get_cursor_signature(c1)
     sig2 = get_cursor_signature(c2)
     if sig1 != sig2:
@@ -136,30 +120,26 @@ def check_AST(file1,file2):
 
     ok, msg = compare_cursors(cursor1, cursor2)
     if ok:
-        print("✅ ASTs are structurally identical.")
+        print(" ASTs are structurally identical.")
         return True,msg
     else:
-        print(f"❌ ASTs differ: {msg}")
+        print(f" ASTs differ: {msg}")
         return False,msg
 
 def batch_compare_folders(folder1: str, folder2: str, pattern="*.c"):
-    """
-    遍历 folder1 中的所有 .c 文件，在 folder2 中查找同名文件并比较 AST。
-    """
     folder1_path = Path(folder1)
     folder2_path = Path(folder2)
 
     if not folder1_path.exists():
-        print(f"❌ Folder not found: {folder1}")
+        print(f" Folder not found: {folder1}")
         return
     if not folder2_path.exists():
-        print(f"❌ Folder not found: {folder2}")
+        print(f" Folder not found: {folder2}")
         return
 
-    # 收集第一个文件夹中所有 .c 文件
     c_files = list(folder1_path.glob(pattern))
     if not c_files:
-        print(f"⚠️ No {pattern} files found in {folder1}")
+        print(f" No {pattern} files found in {folder1}")
         return
 
     total = len(c_files)
@@ -172,39 +152,35 @@ def batch_compare_folders(folder1: str, folder2: str, pattern="*.c"):
     for file1 in sorted(c_files):
         file2 = folder2_path / file1.name
         if not file2.exists():
-            print(f"⚠️ Skipped: {file1.name} (not found in {folder2})")
+            print(f" Skipped: {file1.name} (not found in {folder2})")
             skipped += 1
             continue
 
         print(f"→ {file1.name}: ", end="")
         try:
-            # 注意：check_AST 内部会对 file2 进行过滤处理，这里直接调用
             ok, msg = check_AST(str(file1), str(file2))
             if ok:
-                print("✅ identical")
+                print(" identical")
                 passed += 1
             else:
-                print(f"❌ differs - {msg}")
+                print(f" differs - {msg}")
                 failed += 1
         except Exception as e:
             print(f"💥 error - {e}")
             failed += 1
 
-    # 输出统计
     print("\n" + "="*50)
-    print(f"📊 Summary: Total={total}, Passed={passed}, Failed={failed}, Skipped={skipped}")
+    print(f" Summary: Total={total}, Passed={passed}, Failed={failed}, Skipped={skipped}")
     print("="*50)
 
 
 if __name__ == "__main__":
     import sys
     if len(sys.argv) == 3:
-        # 单对文件比较模式
         file1, file2 = sys.argv[1], sys.argv[2]
         ok, msg = check_AST(file1, file2)
         sys.exit(0 if ok else 1)
     elif len(sys.argv) == 4 and sys.argv[1] == "--batch":
-        # 批量文件夹模式
         _, _, folder1, folder2 = sys.argv
         batch_compare_folders(folder1, folder2)
     else:

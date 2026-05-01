@@ -2,12 +2,12 @@
 #!/usr/bin/env python3
 """
 Rank Function Assertion Validator (SV-COMP Standard Final Version)
-✅ Fixed lexicographic/two-phase assertion structure validation
-✅ Strict phase-switch condition validation: new_rank1<0 && old_rank1<0
-✅ Full support for while and for loops
-✅ All error messages and reports in professional English
-✅ Removed ParenExpr references (pycparser compatibility)
-✅ Precise || sub-node extraction for structural validation
+ Fixed lexicographic/two-phase assertion structure validation
+ Strict phase-switch condition validation: new_rank1<0 && old_rank1<0
+ Full support for while and for loops
+ All error messages and reports in professional English
+ Removed ParenExpr references (pycparser compatibility)
+ Precise || sub-node extraction for structural validation
 """
 import os
 import sys
@@ -442,16 +442,16 @@ def main():
     args = parser.parse_args()
     
     if not os.path.isdir(args.dir_path):
-        print(f"❌ Error: '{args.dir_path}' is not a valid directory", file=sys.stderr)
+        print(f" Error: '{args.dir_path}' is not a valid directory", file=sys.stderr)
         sys.exit(11)
     
     c_files = get_c_files(args.dir_path)
     if not c_files:
-        print(f"⚠️  Warning: No .c files found in directory '{args.dir_path}'")
+        print(f"  Warning: No .c files found in directory '{args.dir_path}'")
         sys.exit(0)
     
-    print(f"📁 Validation directory: {os.path.abspath(args.dir_path)}")
-    print(f"📋 Found {len(c_files)} C source files, starting validation...\n")
+    print(f" Validation directory: {os.path.abspath(args.dir_path)}")
+    print(f" Found {len(c_files)} C source files, starting validation...\n")
     
     results = []
     for idx, fname in enumerate(c_files, 1):
@@ -477,17 +477,17 @@ def main():
     
     # Generate summary report
     print("\n" + "="*65)
-    print("📊 Validation Summary Report")
+    print(" Validation Summary Report")
     print("="*65)
     
     passed = [r for r in results if r[1]]
     failed = [r for r in results if not r[1]]
     
-    print(f"\n✅ Passed: {len(passed)}")
+    print(f"\n Passed: {len(passed)}")
     for f, _, m in passed:
         print(f"   • {f} ({m})")
     
-    print(f"\n❌ Failed: {len(failed)}")
+    print(f"\n Failed: {len(failed)}")
     for f, _, m in failed:
         if "No loop" in m or "requires 2 or 3 assertions" in m:
             print(f"   • {f}")
@@ -496,7 +496,7 @@ def main():
             print(f"   • {f} | {m}")
     
     print("\n" + "="*65)
-    print(f"📈 Total: {len(results)} | Passed: {len(passed)} | Failed: {len(failed)}")
+    print(f" Total: {len(results)} | Passed: {len(passed)} | Failed: {len(failed)}")
     print("="*65)
     
     # Exit code: 0 if no critical failures, 1 otherwise
@@ -507,7 +507,7 @@ if __name__ == '__main__':
     try:
         import pycparser
     except ImportError:
-        print("❌ Dependency missing: Please install pycparser", file=sys.stderr)
+        print(" Dependency missing: Please install pycparser", file=sys.stderr)
         print("   Run: pip install pycparser", file=sys.stderr)
         sys.exit(1)
     
