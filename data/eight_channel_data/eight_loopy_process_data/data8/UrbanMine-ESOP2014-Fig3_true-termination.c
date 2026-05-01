@@ -1,0 +1,31 @@
+// Source: data/benchmarks/tpdb/C_Integer/Stroeder_15/UrbanMine-ESOP2014-Fig3_true-termination.c
+
+
+extern int __VERIFIER_nondet_int(void);
+
+
+
+int main() {
+	int x;
+	int y;
+	x = __VERIFIER_nondet_int();
+	y = __VERIFIER_nondet_int();
+	while (x != 0 && y > 0) {
+	    if (x > 0) {
+		    if (__VERIFIER_nondet_int() != 0) {
+			    x = x - 1;
+				y = __VERIFIER_nondet_int();
+			} else {
+			    y = y - 1;
+			}
+		} else {
+		    if (__VERIFIER_nondet_int() != 0) {
+			    x = x + 1;
+			} else {
+			    y = y - 1;
+				x = __VERIFIER_nondet_int();
+			}		
+		}
+	}
+    return 0;
+}

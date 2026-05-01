@@ -1,0 +1,22 @@
+// Source: data/benchmarks/tpdb/C_Integer/Stroeder_15/LeikeHeizmann-TACAS2014-Ex9_true-termination.c
+
+
+extern int __VERIFIER_nondet_int(void);
+
+
+
+int main() {
+    int p, q;
+	q = __VERIFIER_nondet_int();
+	p = __VERIFIER_nondet_int();
+	while (q > 0 && p > 0 && p != q) {
+		if (q < p) {
+			q = q - 1;
+		} else {
+			if (p < q) {
+				p = p - 1;
+			}
+		}
+	}
+	return 0;
+}

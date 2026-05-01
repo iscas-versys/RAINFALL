@@ -1,0 +1,28 @@
+# 编译生成的二进制
+llvm/bin/veri-clang
+llvm/bin/veri-clang++
+llvm/lib/veri-llvm-pass.so
+llvm/veri-clang/veri-clang
+llvm/veri-clang/veri-clang++
+# 构建目录
+llvm/llvm-pass/build/
+clang+llvm/
+SpecLoC.txt
+# 对象文件
+*.o
+*.so
+api_keys.json
+# CMake 临时文件
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+
+# Python 虚拟环境
+rainfall_env/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 结果目录（根据需要决定是否保留）
+termination_result*/

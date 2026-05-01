@@ -1,0 +1,22 @@
+// Source: data/benchmarks/tpdb/C_Integer/Stroeder_15/AliasDarteFeautrierGonnord-SAS2010-wise_true-termination.c
+
+
+extern int __VERIFIER_nondet_int(void);
+
+
+
+int main() {
+    int x, y;
+	x = __VERIFIER_nondet_int();
+	y = __VERIFIER_nondet_int();
+	if (x >= 0 && y >= 0) {
+		while (x - y > 2 || y - x > 2) {
+			if (x < y) {
+				x = x + 1;
+			} else {
+				y = y + 1;
+			}
+		}
+	}
+	return 0;
+}
