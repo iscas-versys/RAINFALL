@@ -21,8 +21,8 @@ def save_dict_to_txt(data_dict, filename):
     try:
         with open(filename, 'w', encoding='utf-8') as f:
 
-            f.write("name\tresult\tin_tokens\tout_tokens\ttime_used\n")
-            f.write("-" * 30 + "\n")
+            f.write("name\t\tverification process\tin_tokens\tout_tokens\ttime_used\tresult\n")
+            f.write("-" * 126 + "\n")
             
             for name, result in data_dict.items():
                 f.write(f"{name}\t{result}\n")

@@ -141,12 +141,13 @@ def process_c_files(folder_path, llm_max, counter_max,output_dir="termination_re
     print(f"Found {len(c_files)} C files. Starting analysis...")
     result = ""
     result_dict = {}
+    true_cnt = 0
     for i, file_path in enumerate(c_files):
         file_name = os.path.basename(file_path)
         result_dict.setdefault(file_name, "FALSE")
-        print("file_path:",file_path)
+        print(f"Analysis completed for {i} files. {true_cnt} programs proved to terminate.")
         print(f"Processing ({i+1}/{len(c_files)}): {file_name}")
-
+        final_result = "FALSE"
         total_input_tokens = 0
         total_output_tokens = 0
         total_analysis_time = 0.0
@@ -296,7 +297,7 @@ def process_c_files(folder_path, llm_max, counter_max,output_dir="termination_re
                     result = result.replace("```","")
                     save_string_to_file(result +"\n",result_path + "/" + file_name)
                     save_string_to_file(result +"\n",result_path + "/" + file_name.replace(".c","_"+str(j)+"_.c"))
-                    #
+                   # -------------------------------- UAutomizer CHECK --------------------------------
                     ultimate_result,ultimate_time  = run_termination_command(result_path + "/" + file_name,file_name.replace(".c",""),ultimate_dir)
                     total_analysis_time += ultimate_time   
                     if ultimate_result == False:
@@ -310,13 +311,17 @@ def process_c_files(folder_path, llm_max, counter_max,output_dir="termination_re
                     with open(result_path + "/" + file_name.replace(".c","")+".txt", "r") as f:
                         ultimate_answer = f.read()
                         if ultimate_answer.find("RESULT: Ultimate proved your program to be correct!") != -1:
-                            result_dict[file_name]=result_dict[file_name] +"TRUE"+str(llm_stage)+" "+str(j)
+                            final_result = "TRUE"
+                            true_cnt = true_cnt+1
+                            result_dict[file_name]=result_dict[file_name] +"TRUE_Initial_"+str(llm_stage)+"_iterate_"+str(j)
                             print("Analysis succeeded: program terminates. Results saved.")
+                            
                             analyze_finish = 1
                             break                    
                     j = j+1
                     if j >= jmax:
                         break
+                   # -------------------------------- CounterExample --------------------------------
                     cex_list = extract_counterexample(ultimate_answer)
                     _tPrompt = generate_counterexample_prompt(llvm_c,cex_list)
                     result_dict[file_name] = result_dict[file_name] + "_COUNTER"+str(j)+" "
@@ -331,8 +336,10 @@ def process_c_files(folder_path, llm_max, counter_max,output_dir="termination_re
                     result = result.replace("```c","")
                     result = result.replace("```","")
                     save_string_to_file(result +"\n",result_path + "/" + file_name.replace(".c","")+".c")
-        result_dict[file_name] += f"\t{total_input_tokens}\t{total_output_tokens}\t{total_analysis_time:.2f}"
+        result_dict[file_name] += f"\t{total_input_tokens}\t{total_output_tokens}\t{total_analysis_time:.2f}\t{final_result}"
         save_dict_to_txt(result_dict,result_path + "/result_dict.txt")
+    
+    print(f"Analysis completed for {i} files. {true_cnt} programs proved to terminate.")
 
 def log_llm_interaction(base_filename, prompt, response):
     """
