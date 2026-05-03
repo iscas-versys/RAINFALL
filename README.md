@@ -85,13 +85,7 @@ apt-get install -y openjdk-21-jre wget unzip g++
 cd Your_Project_Path
 wget https://github.com/ultimate-pa/ultimate/releases/download/v0.3.1/UltimateAutomizer-linux.zip
 unzip UltimateAutomizer-linux.zip
-export PATH=/Your_UAutomizer_WorkPath/:$PATH
+export PATH=/app/UAutomizer-linux/:$PATH
 
 # 12. Run the termination analysis
-python main.py \
-    --llm-max 2 --iterate-max 5 \
-    --data-path="./data/freqterm_data/" \
-    --result-path="./termination_result1" \
-    --platform=deepseek \
-    --model=deepseek-v4-pro\
-    --ultimate-dir=Your_UAutomizer_WorkPath
+python main.py     --llm-max 2 --iterate-max 5     --data-path="./data/eight_channel_data/eight_freqterm_process_data/data8/"     --result-path="./termination_result1"     --platform=deepseek     --model=deepseek-v4-pro    --ultimate-dir=/app/UAutomizer-linux

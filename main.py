@@ -339,7 +339,7 @@ def process_c_files(folder_path, llm_max, counter_max,output_dir="termination_re
         result_dict[file_name] += f"\t{total_input_tokens}\t{total_output_tokens}\t{total_analysis_time:.2f}\t{final_result}"
         save_dict_to_txt(result_dict,result_path + "/result_dict.txt")
     
-    print(f"Analysis completed for {i} files. {true_cnt} programs proved to terminate.")
+    print(f"Analysis completed for {i+1} files. {true_cnt} programs proved to terminate.")
 
 def log_llm_interaction(base_filename, prompt, response):
     """
@@ -438,7 +438,7 @@ def run_termination_command(c_path, filename, ultimate_dir):
         stdout, stderr = process.communicate(timeout=60)
         output = stdout + stderr
         call_time = time.time() - start_time
-        print(f"Ultimate execution completed within 60 seconds, 耗时: {call_time:.2f}秒")
+        print(f"Ultimate execution completed within 60 seconds, time consumed: {call_time:.2f}s")
         
     except subprocess.TimeoutExpired:
         print(f"Ultimate execution timed out after 60 seconds, killing process group...")
