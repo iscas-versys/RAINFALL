@@ -20,7 +20,9 @@ This guide covers how to set up the required environment for RAINFALL.
 ---
 
 ## Quick Start
+We also provide a complete artifact at https://drive.google.com/file/d/1Ct0qf3YeseJPNNpVB2N49KjRAnVXvD3L/view?usp=drive_link, which includes a full Docker environment and installation/usage steps. 
 
+If you prefer not to use Docker, you can follow the steps below to install.
 
 
 ```bash
