@@ -18,12 +18,124 @@ This guide covers how to set up the required environment for RAINFALL.
 
 
 ---
+## Resource Requirements
 
+Based on actual measurement using `docker stats` during a full run:
+
+| Resource        | Observed Peak    | Recommended (for safe execution)                |
+|-----------------|------------------|-------------------------------------------------|
+| **RAM**         | ~1 GB            | **≥ 2 GB**                                      |
+| **CPU**         | ~670% (~6–7 cores) | **≥ 4 cores** (works with 1, but slower)        |
+| **Network**     | minimal (only for LLM API calls) | stable internet connection when using cloud LLM |
+
+*Run time: approximately 1 minute for the provided small example; full dataset evaluation may take several hours depending on LLM response time and iteration count.*
+
+---
+
+## Artifact Structure
+
+```
+RAINFALL/
+├── README.md                       # This guide: setup, usage, expected output
+├── LICENSE                         # Open-source license
+├── main.py                         # Main entry point – runs termination analysis
+├── utils.py                        # Utility functions (file I/O, logging, etc.)
+├── prompt/                         # Prompt templates for the LLM (DeepSeek, etc.)
+├── clang+llvm/                     # Pre-packaged Clang & LLVM 12.0.1 toolchain
+├── data/                           # Benchmark / test datasets (C source files)
+├── example/                        # Minimal working example for quick verification
+│   ├── input/                      #   Input C program (e.g., a bounded loop)
+│   │   └── for_bounded_loop1_*.c
+│   └── output/                     #   Expected output files
+│       ├── TerminalOutput.txt      #     Example of terminal output
+│       └── termination_result_example/
+│           ├── *.c                 #     Original source copy
+│           ├── *_delLLMGen.c       #     Source with LLM-generated parts removed
+│           ├── *.llm_log.txt       #     LLM interaction log
+│           ├── *.graphml           #     Verification witness (GraphML)
+│           ├── *.yml               #     Verification witness (YAML)
+│           └── result_dict.txt     #     Final result summary
+├── llvm/                           # LLVM IR-related scripts or intermediate files
+├── scripts/                        # Install scripts and auxiliary tools
+└── static_check/                   # Custom static checkers / analyser configurations
+```
 ## Quick Start
 We also provide a complete artifact at [https://drive.google.com/file/d/1Ct0qf3YeseJPNNpVB2N49KjRAnVXvD3L/view?usp=drive_link](https://drive.google.com/file/d/1w77HKm4Wtwi1Sw9pwfs73XQUkFBKSwXw/view?usp=drive_link), which includes a full Docker environment and installation/usage steps. 
 
-If you prefer not to use Docker, you can follow the steps below to install.
+## How to Run Using the Pre-built Docker Image
 
+The artifact is shipped as a portable Docker image (`rainfall-artifact.tar`) that packs all required dependencies, tools, and test data. No additional installation is needed.
+
+### Step 1: Load the Docker Image
+```bash
+docker load -i rainfall-artifact.tar
+```
+After loading, you should see the image `rainfall-artifact:v1` listed.
+Verify with:
+```bash
+docker images | grep rainfall-artifact
+```
+
+### Step 2: Run a Container from the Image
+```bash
+docker run -it --name rainfall rainfall-artifact:v1
+```
+This will drop you into the container’s bash shell. All project files are located under `/artifact`.  
+By default, the working directory is `/artifact/RAINFALL`.
+
+> **Note**: If you need to run the container again after exiting, use `docker start -ai rainfall`.
+
+### Step 3: Activate the Python Virtual Environment
+Inside the container:
+```bash
+source /artifact/RAINFALL/rainfall_env/bin/activate
+```
+
+### Step 4: Set Up the PATH for Ultimate Automizer
+```bash
+export PATH=/artifact/UAutomizer-linux/:$PATH
+```
+
+### Step 5: Provide Your LLM API Key
+To use cloud‑based LLMs (DeepSeek, Aliyun, OpenRouter), you must create a file named `api_keys.json` in the working directory with your own API keys.  
+**We do NOT include real keys in the artifact.**
+
+Create the file (inside `/artifact/RAINFALL`):
+```bash
+cat > api_keys.json << 'EOF'
+{
+    "deepseek": {
+        "api_key": "your-deepseek-api-key",
+        "url": "https://api.deepseek.com/chat/completions"
+    },
+    "aliyun": {
+        "api_key": "your-aliyun-api-key",
+        "url": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+    },
+    "openrouter": {
+        "api_key": "your-openrouter-api-key",
+        "url": "https://openrouter.ai/api/v1/chat/completions"
+    }
+}
+EOF
+```
+Replace the placeholder text with your actual API keys. Only the services you intend to use need valid keys.
+
+### Step 6: Run the Tool on the Provided Example
+Execute the following command inside the container (still in `/artifact/RAINFALL`):
+```bash
+python main.py \
+    --llm-max 2 \
+    --iterate-max 5 \
+    --data-path="./example/input/" \
+    --result-path="./termination_result_example" \
+    --platform=deepseek \
+    --model=deepseek-v4-pro \
+    --ultimate-dir=/artifact/UAutomizer-linux
+```
+This will run the termination analysis on the small example (a bounded loop program).
+
+If you prefer not to use Docker, you can follow the steps below to install.
 
 ```bash
 
