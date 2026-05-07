@@ -89,6 +89,7 @@ By default, the working directory is `/artifact/RAINFALL`.
 Inside the container:
 ```bash
 source /artifact/RAINFALL/rainfall_env/bin/activate
+source ./scripts/requires/init_env.sh
 ```
 
 ### Step 4: Set Up the PATH for Ultimate Automizer
@@ -134,6 +135,8 @@ python main.py \
     --ultimate-dir=/artifact/UAutomizer-linux
 ```
 This will run the termination analysis on the small example (a bounded loop program).
+
+## How to Run without Docker
 
 If you prefer not to use Docker, you can follow the steps below to install.
 
