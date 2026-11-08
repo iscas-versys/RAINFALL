@@ -1,19 +1,20 @@
 
 #!/usr/bin/env python3
-"""
-Rank Function Assertion Validator (SV-COMP Standard Final Version)
- Fixed lexicographic/two-phase assertion structure validation
- Strict phase-switch condition validation: new_rank1<0 && old_rank1<0
- Full support for while and for loops
- All error messages and reports in professional English
- Removed ParenExpr references (pycparser compatibility)
- Precise || sub-node extraction for structural validation
+"""Ranking-function assertion validator.
+
+The assertions attached to the loop are compared with the canonical decrease
+and termination assertions of the ranking class by logical equivalence over
+atomic predicates. Presence-based checks are deliberately not used: a
+tautology such as ``P || 1`` must not pass.
 """
 import os
 import sys
 import re
 import argparse
 from pycparser import c_parser, c_ast
+from pycparser.c_generator import CGenerator
+
+MAX_ATOMS = 18
 
 # ==================== Preprocessing Core ====================
 def remove_c_comments(text):
@@ -30,25 +31,25 @@ def preprocess_for_pycparser(c_code):
         lambda m: f'__RANK_ASSERT({m.group(1) if m.group(1) else m.group(2)});',
         c_code
     )
-    
+
     # Remove all comments
     c_code = remove_c_comments(c_code)
-    
+
     # Remove all preprocessor directives
     c_code = re.sub(r'^\s*#.*$', '', c_code, flags=re.MULTILINE)
-    
+
     # Rewrite extern declarations to standard function declarations
     c_code = re.sub(
         r'extern\s+\w+\s+(__VERIFIER_\w+)\s*\([^)]*\)\s*;',
         r'int \1(void);',
         c_code
     )
-    
+
     # Clean whitespace
     c_code = re.sub(r'\n\s*\n', '\n\n', c_code)
     c_code = re.sub(r'[ \t]+$', '', c_code, flags=re.MULTILINE)
     c_code = c_code.strip()
-    
+
     # Inject required base declarations
     header = """typedef unsigned int size_t;
 typedef long __builtin_va_list;
@@ -58,368 +59,369 @@ void __RANK_ASSERT(int);"""
 # ==================== AST Helper Tools ====================
 class GuardExtractor(c_ast.NodeVisitor):
     """Extract loop guard expression (supports while and for loops)"""
-    def __init__(self): 
+    def __init__(self):
         self.expr = None
         self.found = False
-    
+
     def visit_While(self, node):
         if not self.found and self.expr is None:
             self.expr = node.cond
             self.found = True
         return
-    
+
     def visit_For(self, node):
         if not self.found and self.expr is None and node.cond is not None:
             self.expr = node.cond
             self.found = True
         return
 
-class RankCounter(c_ast.NodeVisitor):
-    """Count old_rank variable declarations"""
-    def __init__(self): 
-        self.count = 0
-        self.names = []          # 新增：记录变量名
+
+def is_integer_rank_type(decl_type):
+    if not isinstance(decl_type, c_ast.TypeDecl):
+        return False
+    if not isinstance(decl_type.type, c_ast.IdentifierType):
+        return False
+    names = decl_type.type.names
+    return 'int' in names or 'long' in names
+
+
+class GhostDeclCollector(c_ast.NodeVisitor):
+    def __init__(self):
+        self.old = {}
+        self.new = {}
+
     def visit_Decl(self, node):
-        if (isinstance(node.type, c_ast.TypeDecl) and 
-            hasattr(node.type.type, 'names') and
-            node.name and node.name.startswith('old_rank')):
-            self.count += 1
-            self.names.append(node.name)   # 新增：收集变量名
+        name = node.name or ''
+        if re.match(r'^old_rank\d+$', name):
+            self.old[name] = node
+        elif re.match(r'^new_rank\d+$', name):
+            self.new[name] = node
         self.generic_visit(node)
 
-class AssertExtractor(c_ast.NodeVisitor):
-    """Extract __RANK_ASSERT call conditions"""
-    def __init__(self): self.asserts = []
+
+# ==================== Boolean formulas over atomic predicates ====================
+def _text(node):
+    try:
+        return re.sub(r'\s+', '', CGenerator().visit(node))
+    except Exception:
+        return '<unparseable>'
+
+
+def _cmp_key(op, left, right):
+    lt, rt = _text(left), _text(right)
+    if op == '==':
+        return min(lt + '==' + rt, rt + '==' + lt)
+    if op == '>':
+        return min(lt + '>' + rt, rt + '<' + lt)
+    if op == '<':
+        return min(lt + '<' + rt, rt + '>' + lt)
+    return _text(c_ast.BinaryOp(op=op, left=left, right=right))
+
+
+def formula(node):
+    """Translate an expression into ('atom', key) / ('not', f) / ('and'/'or', [f])."""
+    if node is None:
+        return ('atom', '<none>')
+    if isinstance(node, c_ast.UnaryOp) and node.op == '!':
+        return ('not', formula(node.expr))
+    if isinstance(node, c_ast.BinaryOp) and node.op in ('&&', '||'):
+        kind = 'and' if node.op == '&&' else 'or'
+        return (kind, [formula(node.left), formula(node.right)])
+    if isinstance(node, c_ast.BinaryOp) and node.op in ('<', '>', '==', '<=', '>=', '!='):
+        op = node.op
+        if op == '<=':
+            return ('not', ('atom', _cmp_key('>', node.left, node.right)))
+        if op == '>=':
+            return ('not', ('atom', _cmp_key('<', node.left, node.right)))
+        if op == '!=':
+            return ('not', ('atom', _cmp_key('==', node.left, node.right)))
+        return ('atom', _cmp_key(op, node.left, node.right))
+    return ('atom', _text(node))
+
+
+def _collect_atoms(f, acc):
+    if f[0] == 'atom':
+        acc.add(f[1])
+    elif f[0] == 'not':
+        _collect_atoms(f[1], acc)
+    else:
+        for child in f[1]:
+            _collect_atoms(child, acc)
+
+
+def _eval(f, env):
+    if f[0] == 'atom':
+        return env[f[1]]
+    if f[0] == 'not':
+        return not _eval(f[1], env)
+    if f[0] == 'and':
+        return all(_eval(child, env) for child in f[1])
+    return any(_eval(child, env) for child in f[1])
+
+
+def equivalent(f, g):
+    """Exhaustive truth-table equivalence; fail closed when there are too many atoms."""
+    atoms = set()
+    _collect_atoms(f, atoms)
+    _collect_atoms(g, atoms)
+    atoms = sorted(atoms)
+    if len(atoms) > MAX_ATOMS:
+        return False
+    for mask in range(1 << len(atoms)):
+        env = {atom: bool((mask >> i) & 1) for i, atom in enumerate(atoms)}
+        if _eval(f, env) != _eval(g, env):
+            return False
+    return True
+
+
+def conjunction(formulas):
+    if not formulas:
+        return ('atom', '<true>')
+    result = formulas[0]
+    for item in formulas[1:]:
+        result = ('and', [result, item])
+    return result
+
+
+# ==================== Canonical assertion construction ====================
+def _id(name):
+    return c_ast.ID(name=name)
+
+
+def _zero():
+    return c_ast.Constant(type='int', value='0')
+
+
+def _bin(op, left, right):
+    return c_ast.BinaryOp(op=op, left=left, right=right)
+
+
+def _not(node):
+    return c_ast.UnaryOp(op='!', expr=node)
+
+
+def _and(nodes):
+    result = nodes[0]
+    for node in nodes[1:]:
+        result = _bin('&&', result, node)
+    return result
+
+
+def _or(nodes):
+    result = nodes[0]
+    for node in nodes[1:]:
+        result = _bin('||', result, node)
+    return result
+
+
+def _old(i):
+    return _id('old_rank%d' % i)
+
+
+def _new(i):
+    return _id('new_rank%d' % i)
+
+
+def _ge0(node):
+    return _bin('>=', node, _zero())
+
+
+def _lt0(node):
+    return _bin('<', node, _zero())
+
+
+def canonical_assertions(cls, n, guard):
+    """Return (decrease_formula, termination_formula) for a ranking class."""
+    if cls == 'single':
+        decrease = _and([_bin('>', _old(1), _new(1)), _ge0(_old(1))])
+        termination = _or([_ge0(_new(1)), _not(guard)])
+    elif cls == 'lexicographic':
+        branches = []
+        for i in range(1, n + 1):
+            parts = [_bin('==', _old(j), _new(j)) for j in range(1, i)]
+            parts.append(_bin('>', _old(i), _new(i)))
+            branches.append(_and(parts))
+        decrease = _and([_or(branches)] + [_ge0(_old(j)) for j in range(1, n + 1)])
+        termination = _or([_and([_ge0(_new(j)) for j in range(1, n + 1)]), _not(guard)])
+    else:  # multiphase
+        branches = []
+        for i in range(1, n + 1):
+            parts = []
+            for j in range(1, i):
+                parts.extend([_lt0(_old(j)), _lt0(_new(j))])
+            parts.extend([_ge0(_old(i)), _bin('>', _old(i), _new(i))])
+            branches.append(_and(parts))
+        decrease = _or(branches)
+        termination = _or([_ge0(_new(n)), _not(guard)])
+    return formula(decrease), formula(termination)
+
+
+# ==================== Assertion purity and placement ====================
+class SideEffectChecker(c_ast.NodeVisitor):
+    def __init__(self):
+        self.errors = []
+
+    def visit_Assignment(self, node):
+        self.errors.append('assignment expression inside an assertion')
+
+    def visit_FuncCall(self, node):
+        name = node.name.name if isinstance(node.name, c_ast.ID) else '<call>'
+        self.errors.append("function call '%s(...)' inside an assertion" % name)
+
+    def visit_UnaryOp(self, node):
+        if node.op in ('p++', 'p--', '++', '--'):
+            self.errors.append('increment/decrement inside an assertion')
+            return
+        self.visit(node.expr)
+
+
+class AssertCounter(c_ast.NodeVisitor):
+    def __init__(self):
+        self.count = 0
+
     def visit_FuncCall(self, node):
         if isinstance(node.name, c_ast.ID) and node.name.name == '__RANK_ASSERT':
-            if node.args and node.args.exprs:
-                self.asserts.append(node.args.exprs[0])
+            self.count += 1
         self.generic_visit(node)
 
-# ==================== Expression Normalization ====================
-def normalize_expr(node):
-    """Normalize expression for comparison (remove spacing differences)"""
-    if node is None: return ""
-    class Normalizer(c_ast.NodeVisitor):
-        def __init__(self): self.res = []
-        def visit_ID(self, n): self.res.append(n.name)
-        def visit_Constant(self, n): self.res.append(n.value)
-        def visit_BinaryOp(self, n):
-            self.visit(n.left); self.res.append(n.op); self.visit(n.right)
-        def visit_UnaryOp(self, n):
-            self.res.append(n.op); self.visit(n.expr)
-        def generic_visit(self, n): super().generic_visit(n)
-    norm = Normalizer()
-    norm.visit(node)
-    return ''.join(norm.res).replace(' ', '')
 
-# ==================== Condition Checker ====================
-def _has_condition(node, target_var, target_op, target_val):
-    """
-    Recursively check if AST node contains specified condition
-    target_val: '0' for constant zero, otherwise variable name (e.g., 'new_rank1')
-    """
-    if node is None:
-        return False
-    if isinstance(node, c_ast.BinaryOp):
-        if node.op == target_op:
-            if isinstance(node.left, c_ast.ID) and node.left.name == target_var:
-                if target_val == '0':
-                    if isinstance(node.right, c_ast.Constant) and node.right.value == '0':
-                        return True
-                else:
-                    if isinstance(node.right, c_ast.ID) and node.right.name == target_val:
-                        return True
-        return (_has_condition(node.left, target_var, target_op, target_val) or
-                _has_condition(node.right, target_var, target_op, target_val))
-    if isinstance(node, c_ast.UnaryOp):
-        return _has_condition(node.expr, target_var, target_op, target_val)
-    return False
+def _assert_statement(stmt):
+    if isinstance(stmt, c_ast.FuncCall):
+        if isinstance(stmt.name, c_ast.ID) and stmt.name.name == '__RANK_ASSERT':
+            if stmt.args and stmt.args.exprs:
+                return stmt.args.exprs[0]
+    return None
 
-# ==================== Structure Validation ====================
-def validate_two_phase_decrease(or_node):
-    """Validate || node for two-phase rank structure"""
-    if not (isinstance(or_node, c_ast.BinaryOp) and or_node.op == '||'):
-        return False, "Not a logical OR (||) node"
-    
-    left, right = or_node.left, or_node.right
-    
-    if not _has_condition(left, 'old_rank1', '>=', '0'):
-        return False, "Left branch missing: old_rank1 >= 0"
-    if not _has_condition(left, 'old_rank1', '>', 'new_rank1'):
-        return False, "Left branch missing: old_rank1 > new_rank1"
-    
-    checks = [
-        ('new_rank1', '<', '0', "new_rank1 < 0 (phase switch trigger condition)"),
-        ('old_rank1', '<', '0', "old_rank1 < 0 (previous iteration already negative)"),
-        ('old_rank2', '>=', '0', "old_rank2 >= 0 (current component non-negative)"),
-        ('old_rank2', '>', 'new_rank2', "old_rank2 > new_rank2 (current component strictly decreasing)")
-    ]
-    
-    for var, op, val, desc in checks:
-        if not _has_condition(right, var, op, val):
-            return False, f"Right branch missing: {desc}"
-    
-    return True, "Two-phase structure complete"
 
-def validate_lexicographic_decrease(or_node):
-    """Validate || node for lexicographic rank structure"""
-    if not (isinstance(or_node, c_ast.BinaryOp) and or_node.op == '||'):
-        return False, "Not a logical OR (||) node"
-    
-    left, right = or_node.left, or_node.right
-    
-    if not _has_condition(left, 'old_rank1', '>', 'new_rank1'):
-        return False, "Left branch missing: old_rank1 > new_rank1"
-    if not _has_condition(right, 'old_rank1', '==', 'new_rank1'):
-        return False, "Right branch missing: old_rank1 == new_rank1"
-    if not _has_condition(right, 'old_rank2', '>', 'new_rank2'):
-        return False, "Right branch missing: old_rank2 > new_rank2"
-    
-    return True, "Lexicographic structure complete"
+def _contiguous(names, prefix):
+    pattern = re.compile(r'^%s(\d+)$' % prefix)
+    indices = []
+    for name in names:
+        match = pattern.match(name)
+        if not match:
+            return None
+        indices.append(int(match.group(1)))
+    if not indices:
+        return None
+    if sorted(indices) != list(range(1, len(indices) + 1)):
+        return None
+    return len(indices)
 
-def validate_decrease_logic(assert_nodes, rank_cnt, old_rank_names=None):
-    """
-    Validate decrement logic:
-    - For rank_cnt=2 with single assertion: extract || sub-node and validate structure
-    - Verify all old_rank >= 0 conditions exist in full assertion
-    """
-    if rank_cnt == 2 and len(assert_nodes) == 1:
-        node = assert_nodes[0]
-        
-        # Step 1: Extract || sub-node (core decrement comparison)
-        or_node = None
-        def find_or_node(n):
-            nonlocal or_node
-            if isinstance(n, c_ast.BinaryOp) and n.op == '||' and or_node is None:
-                or_node = n
-            if hasattr(n, 'children'):
-                for _, child in n.children():
-                    if or_node is None:
-                        find_or_node(child)
-        
-        find_or_node(node)
-        if or_node is None:
-            return False, "Decrement comparison part (||) not found in assertion"
-        
-        # Step 2: Detect structure type (two-phase vs lexicographic)
-        has_less_zero = False
-        def detect_less_zero(n):
-            nonlocal has_less_zero
-            if isinstance(n, c_ast.BinaryOp) and n.op == '<':
-                if isinstance(n.right, c_ast.Constant) and n.right.value == '0':
-                    has_less_zero = True
-            elif isinstance(n, c_ast.BinaryOp):
-                detect_less_zero(n.left)
-                detect_less_zero(n.right)
-            elif isinstance(n, c_ast.UnaryOp):
-                detect_less_zero(n.expr)
-        
-        detect_less_zero(or_node)
-        
-        # Step 3: Validate || node structure
-        if has_less_zero:
-            is_valid, msg = validate_two_phase_decrease(or_node)
-            if not is_valid:
-                return False, f"Two-phase structure error: {msg}"
-            struct_type = "Two-phase"
-        else:
-            is_valid, msg = validate_lexicographic_decrease(or_node)
-            if not is_valid:
-                return False, f"Lexicographic structure error: {msg}"
-            struct_type = "Lexicographic"
-        
-        # Step 4: Verify all old_rank >= 0 conditions exist in full assertion
-        ge0_vars = set()
-        def collect_ge0(n):
-            if isinstance(n, c_ast.BinaryOp):
-                if (n.op == '>=' and 
-                    isinstance(n.right, c_ast.Constant) and n.right.value == '0' and
-                    isinstance(n.left, c_ast.ID) and n.left.name.startswith('old_rank')):
-                    ge0_vars.add(n.left.name)
-                collect_ge0(n.left)
-                collect_ge0(n.right)
-            elif isinstance(n, c_ast.UnaryOp):
-                collect_ge0(n.expr)
-        
-        collect_ge0(node)
-        
-        expected_old = {f'old_rank{i+1}' for i in range(rank_cnt)}
-        missing_ge0 = expected_old - ge0_vars
-        if missing_ge0:
-            return False, f"Missing non-negative conditions for old_rank: {sorted(missing_ge0)}"
-        
-        return True, f"{struct_type} structure validated (with non-negative conditions)"
-    
-    # Fallback validation for other cases
-    return _fallback_loose_check(assert_nodes, rank_cnt, old_rank_names)
-
-def _fallback_loose_check(assert_nodes, rank_cnt, old_rank_names=None):
-    """Fallback validation for non-two-phase/non-lexicographic cases"""
-    has_gt = False
-    ge0_vars = set()
-    
-    def traverse(n):
-        nonlocal has_gt
-        if isinstance(n, c_ast.BinaryOp):
-            if n.op == '>':
-                if (isinstance(n.left, c_ast.ID) and n.left.name.startswith('old_rank') and
-                    isinstance(n.right, c_ast.ID) and n.right.name.startswith('new_rank')):
-                    has_gt = True
-            elif (n.op == '>=' and 
-                  isinstance(n.right, c_ast.Constant) and n.right.value == '0' and
-                  isinstance(n.left, c_ast.ID) and n.left.name.startswith('old_rank')):
-                ge0_vars.add(n.left.name)
-            traverse(n.left)
-            traverse(n.right)
-        elif isinstance(n, c_ast.UnaryOp):
-            traverse(n.expr)
-    
-    for node in assert_nodes:
-        traverse(node)
-    
-    if not has_gt:
-        return False, "Missing old_rank > new_rank comparison"
-    
-    # 🔧 关键修改：优先使用实际收集到的变量名，回退到数字后缀推断
-    if old_rank_names is not None:
-        expected_old = set(old_rank_names)
-    else:
-        expected_old = {f'old_rank{i+1}' for i in range(rank_cnt)}
-    
-    missing_ge0 = expected_old - ge0_vars
-    if missing_ge0:
-        return False, f"Missing non-negative conditions for old_rank: {sorted(missing_ge0)}"
-    
-    return True, ""
-# ==================== Assertion Validation ====================
-def is_termination_assert(node, guard_norm):
-    """Identify termination assertion: (...) || !(guard)"""
-    if not (isinstance(node, c_ast.BinaryOp) and node.op == '||'):
-        return False
-    if not (isinstance(node.right, c_ast.UnaryOp) and node.right.op == '!'):
-        return False
-    return guard_norm in normalize_expr(node.right.expr)
-
-def validate_termination_assert(node, rank_cnt, guard_norm):
-    """Validate termination assertion: (at least one new_rankX >= 0) || !(guard)"""
-    if not (isinstance(node, c_ast.BinaryOp) and node.op == '||'):
-        return False
-    if not (isinstance(node.right, c_ast.UnaryOp) and node.right.op == '!'):
-        return False
-    if guard_norm not in normalize_expr(node.right.expr):
-        return False
-    
-    has_ge0 = False
-    def check_ge0(n):
-        nonlocal has_ge0
-        if isinstance(n, c_ast.BinaryOp):
-            if (n.op == '>=' and 
-                isinstance(n.right, c_ast.Constant) and n.right.value == '0' and
-                isinstance(n.left, c_ast.ID) and n.left.name.startswith('new_rank')):
-                has_ge0 = True
-            check_ge0(n.left)
-            check_ge0(n.right)
-        elif isinstance(n, c_ast.UnaryOp):
-            check_ge0(n.expr)
-    
-    check_ge0(node.left)
-    return has_ge0
 
 def validate_c_file(c_code, filename="", verbose=False):
-    """Validate single C file"""
+    """Validate the ghost instrumentation and assertions of a candidate."""
     try:
         processed = preprocess_for_pycparser(c_code)
     except Exception as e:
         return False, f"Preprocessing exception: {str(e)[:100]}"
-    
+
     try:
         parser = c_parser.CParser()
         ast = parser.parse(processed, filename='<input>')
     except Exception as e:
         err_msg = str(e).split('\n')[0][:150]
         return False, f"AST parsing failed: {err_msg}"
-    
-    # Extract loop guard
+
     guard_ext = GuardExtractor()
     guard_ext.visit(ast)
     if guard_ext.expr is None:
         return False, "No loop (while or for) detected with guard condition"
-    guard_norm = normalize_expr(guard_ext.expr)
-    
-    # Count rank variables
-    rank_counter = RankCounter()
-    rank_counter.visit(ast)
-    rank_cnt = rank_counter.count
-    if rank_cnt == 0:
-        return False, "No old_rank variables detected"
-    
-    # Locate loop node
+    guard = guard_ext.expr
+
+    decls = GhostDeclCollector()
+    decls.visit(ast)
+    n_old = _contiguous(decls.old.keys(), 'old_rank')
+    n_new = _contiguous(decls.new.keys(), 'new_rank')
+    if n_old is None or n_new is None:
+        return False, "Rank variables must be declared exactly as old_rank1..n and new_rank1..n"
+    if n_old != n_new:
+        return False, f"Rank variable count mismatch: {n_old} old_rank vs {n_new} new_rank"
+    for group in (decls.old, decls.new):
+        for name, decl in group.items():
+            if not is_integer_rank_type(decl.type):
+                return False, f"Rank variable '{name}' must have an integer scalar type"
+    n = n_old
+
     class LoopLocator(c_ast.NodeVisitor):
-        def __init__(self): 
+        def __init__(self):
             self.loop = None
             self.found = False
-        
+
         def visit_While(self, node):
             if not self.found and self.loop is None:
                 self.loop = node
                 self.found = True
             return
-        
+
         def visit_For(self, node):
             if not self.found and self.loop is None:
                 self.loop = node
                 self.found = True
             return
-    
+
     locator = LoopLocator()
     locator.visit(ast)
     if locator.loop is None:
         return False, "No loop node (while or for) found"
-    
-    # Process loop body
     loop_body = locator.loop.stmt
     if not isinstance(loop_body, c_ast.Compound):
-        if loop_body is not None:
-            loop_body = c_ast.Compound(block_items=[loop_body])
-        else:
-            return False, "Loop body is empty"
-    
-    # Extract assertions in loop body
-    assert_ext = AssertExtractor()
-    assert_ext.visit(loop_body)
-    assert_nodes = assert_ext.asserts
-    
-    if len(assert_nodes) not in [2, 3, 4]:
-        return False, f"Loop requires 2 or 3 assertions (SV-COMP standard), found {len(assert_nodes)}"
-    
-    # Classify assertions
-    term_assert = None
-    decr_asserts = []
-    for expr in assert_nodes:
-        if is_termination_assert(expr, guard_norm):
-            if term_assert is not None:
-                return False, "Multiple termination assertions detected"
-            term_assert = expr
-        else:
-            decr_asserts.append(expr)
-    
-    if term_assert is None:
-        return False, "Termination assertion not found (should contain || !(guard) structure)"
-    if not (1 <= len(decr_asserts) <= 3):
-        return False, f"Decrement logic assertions count error: {len(decr_asserts)} (expected 1 to 3)"
-    
-    # Validate termination assertion
-    if not validate_termination_assert(term_assert, rank_cnt, guard_norm):
-        return False, f"Termination assertion invalid | guard='{guard_norm}'"
-    
-    # Validate decrement logic
-    old_rank_names = rank_counter.names
-    decr_valid, decr_msg = validate_decrease_logic(decr_asserts, rank_cnt, old_rank_names)
-    if not decr_valid:
-        return False, f"Decrement logic invalid: {decr_msg}"
-    
-    return True, f"Validation passed | rank_cnt={rank_cnt} | assert_cnt={len(assert_nodes)}"
+        return False, "Loop body is not a compound statement"
+    items = loop_body.block_items or []
+
+    top_level = []
+    for index, stmt in enumerate(items):
+        expr = _assert_statement(stmt)
+        if expr is not None:
+            top_level.append((index, expr))
+    counter = AssertCounter()
+    counter.visit(loop_body)
+    if counter.count != len(top_level):
+        return False, "Assertions must be unconditional statements at the top level of the loop body"
+
+    assert_exprs = [expr for _, expr in top_level]
+    if len(assert_exprs) not in (2, 3, 4):
+        return False, f"Loop requires 2 to 4 assertions, found {len(assert_exprs)}"
+
+    update_indices = []
+    for index, stmt in enumerate(items):
+        if isinstance(stmt, c_ast.Assignment) and isinstance(stmt.lvalue, c_ast.ID):
+            if re.match(r'^new_rank\d+$', stmt.lvalue.name):
+                update_indices.append(index)
+    if not update_indices:
+        return False, "No new_rank update statement found in the loop body"
+    last_update = max(update_indices)
+    if any(index <= last_update for index, _ in top_level):
+        return False, "Assertions must appear after the last new_rank update"
+
+    for expr in assert_exprs:
+        checker = SideEffectChecker()
+        checker.visit(expr)
+        if checker.errors:
+            return False, checker.errors[0]
+
+    classes = ['single'] if n == 1 else ['lexicographic', 'multiphase']
+    formulas = [formula(expr) for expr in assert_exprs]
+
+    failures = []
+    for cls in classes:
+        decr_formula, term_formula = canonical_assertions(cls, n, guard)
+        term_matches = [i for i, f in enumerate(formulas) if equivalent(f, term_formula)]
+        if len(term_matches) != 1:
+            failures.append(
+                f"{cls}: expected exactly one termination assertion, found {len(term_matches)}")
+            continue
+        term_index = term_matches[0]
+        decr_others = [f for i, f in enumerate(formulas) if i != term_index]
+        if not decr_others:
+            failures.append(f"{cls}: missing decrement assertion")
+            continue
+        if not equivalent(conjunction(decr_others), decr_formula):
+            failures.append(f"{cls}: decrement assertions are not equivalent to the canonical claim")
+            continue
+        return True, f"Validation passed | class={cls} | rank_cnt={n} | assert_cnt={len(assert_exprs)}"
+
+    return False, "Assertion mismatch: " + "; ".join(failures)
+
 
 # ==================== Batch Processing ====================
 def get_c_files(directory):
@@ -434,25 +436,25 @@ def get_c_files(directory):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Rank Function Assertion Validator (SV-COMP Standard)",
+        description="Rank Function Assertion Validator (exact logical equivalence)",
         epilog="Example: %(prog)s ./sv-benchmarks/c/termination-crafted -v"
     )
     parser.add_argument('dir_path', help='Directory path containing C programs')
     parser.add_argument('-v', '--verbose', action='store_true', help='Show detailed validation process')
     args = parser.parse_args()
-    
+
     if not os.path.isdir(args.dir_path):
-        print(f" Error: '{args.dir_path}' is not a valid directory", file=sys.stderr)
+        print(f"❌ Error: '{args.dir_path}' is not a valid directory", file=sys.stderr)
         sys.exit(11)
-    
+
     c_files = get_c_files(args.dir_path)
     if not c_files:
-        print(f"  Warning: No .c files found in directory '{args.dir_path}'")
+        print(f"⚠️  Warning: No .c files found in directory '{args.dir_path}'")
         sys.exit(0)
-    
-    print(f" Validation directory: {os.path.abspath(args.dir_path)}")
-    print(f" Found {len(c_files)} C source files, starting validation...\n")
-    
+
+    print(f"📁 Validation directory: {os.path.abspath(args.dir_path)}")
+    print(f"📋 Found {len(c_files)} C source files, starting validation...\n")
+
     results = []
     for idx, fname in enumerate(c_files, 1):
         fpath = os.path.join(args.dir_path, fname)
@@ -462,53 +464,45 @@ def main():
         except Exception as e:
             results.append((fname, False, f"File read failed: {e}"))
             continue
-        
+
         if args.verbose:
             print(f"\n{'='*65}")
             print(f"🔍 [{idx}/{len(c_files)}] {fname}")
             print(f"{'='*65}")
-        
+
         try:
             success, msg = validate_c_file(code, fname, args.verbose)
-        
             results.append((fname, success, msg))
         except Exception as e:
             results.append((fname, False, f"Validation exception: {str(e)[:150]}"))
-    
-    # Generate summary report
+
     print("\n" + "="*65)
-    print(" Validation Summary Report")
+    print("📊 Validation Summary Report")
     print("="*65)
-    
+
     passed = [r for r in results if r[1]]
     failed = [r for r in results if not r[1]]
-    
-    print(f"\n Passed: {len(passed)}")
+
+    print(f"\n✅ Passed: {len(passed)}")
     for f, _, m in passed:
         print(f"   • {f} ({m})")
-    
-    print(f"\n Failed: {len(failed)}")
+
+    print(f"\n❌ Failed: {len(failed)}")
     for f, _, m in failed:
-        if "No loop" in m or "requires 2 or 3 assertions" in m:
-            print(f"   • {f}")
-            print(f"      └─ {m}")
-        else:
-            print(f"   • {f} | {m}")
-    
+        print(f"   • {f} | {m}")
+
     print("\n" + "="*65)
-    print(f" Total: {len(results)} | Passed: {len(passed)} | Failed: {len(failed)}")
+    print(f"📈 Total: {len(results)} | Passed: {len(passed)} | Failed: {len(failed)}")
     print("="*65)
-    
-    # Exit code: 0 if no critical failures, 1 otherwise
-    critical_failures = [r for r in failed if "No loop" not in r[2] and "requires 2 or 3 assertions" not in r[2]]
-    sys.exit(0 if len(critical_failures) == 0 else 1)
+
+    sys.exit(0 if len(failed) == 0 else 1)
 
 if __name__ == '__main__':
     try:
         import pycparser
     except ImportError:
-        print(" Dependency missing: Please install pycparser", file=sys.stderr)
+        print("❌ Dependency missing: Please install pycparser", file=sys.stderr)
         print("   Run: pip install pycparser", file=sys.stderr)
         sys.exit(1)
-    
+
     main()

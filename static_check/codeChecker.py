@@ -52,45 +52,399 @@ def is_integer_rank_type(decl_type):
         return True
 
     return False
-class RankExtractor(c_ast.NodeVisitor):
+# ==================== Ranking-Expression Purity Check ====================
+# Expressions assigned to the ghost ranking variables in the first and third
+# slots must be pure expressions built from program variables and constants.
+# Function calls, assignments to program variables, and increment/decrement
+# expressions on program variables are rejected. Other C expression forms are
+# left to the subsequent checks and to the verifier.
+
+def expr_to_text(node):
+    try:
+        return CGenerator().visit(node)
+    except Exception:
+        return '<unparseable expression>'
+
+class RankingExpressionGrammarChecker(c_ast.NodeVisitor):
+    def __init__(self, scopes, text):
+        self.scopes = scopes
+        self.text = text
+        self.errors = []
+
+    def reject(self, reason):
+        self.errors.append(
+            f"Ranking expression '{self.text}' contains disallowed construct: {reason}.")
+
+    def resolve(self, name):
+        for scope in reversed(self.scopes):
+            if name in scope:
+                return scope[name]
+        return None
+
+    def visit_Assignment(self, node):
+        self.reject('assignment expression')
+
+    def visit_FuncCall(self, node):
+        try:
+            name = node.name.name
+        except AttributeError:
+            name = '<call>'
+        self.reject(f"function call '{name}(...)'")
+
+    def visit_UnaryOp(self, node):
+        if node.op in ('p++', 'p--', '++', '--'):
+            self.reject('increment/decrement')
+            return
+        if node.expr is not None:
+            self.visit(node.expr)
+
+    def visit_StructRef(self, node):
+        if node.name is not None:
+            self.visit(node.name)
+
+    def visit_ID(self, node):
+        name = node.name
+        if name.startswith('old_rank') or name.startswith('new_rank'):
+            self.reject(f"reference to ghost variable '{name}'; only original program variables are allowed")
+            return
+        if self.resolve(name) is None:
+            self.reject(f"undeclared or macro identifier '{name}'")
+
+
+class RankingExpressionCollector(c_ast.NodeVisitor):
+    """Collect new_rank expressions with lexical scope information and check them."""
+
     def __init__(self):
-        self.old_ranks = []
-        self.new_ranks_init = {}      # 最终存储初始化表达式
-        self.new_ranks_declared = set()  # 记录已声明但未初始化的 new_rank 变量
-        self.assignments = []
-        self.in_loop = False          # 辅助标记是否已进入循环
+        self.scopes = [{}]
+        self.errors = []
+
+    def declare(self, name, node):
+        if not name or isinstance(node.type, c_ast.FuncDecl):
+            return
+        self.scopes[-1][name] = node
+
+    def check_expr(self, node):
+        text = expr_to_text(node)
+        checker = RankingExpressionGrammarChecker(self.scopes, text)
+        checker.visit(node)
+        for error in checker.errors:
+            if error not in self.errors:
+                self.errors.append(error)
+
+    def visit_FileAST(self, node):
+        for ext in node.ext:
+            self.visit(ext)
+
+    def visit_FuncDef(self, node):
+        self.scopes.append({})
+        args = node.decl.type.args
+        if args is not None:
+            for param in args.params:
+                self.declare(param.name, param)
+        self.visit(node.body)
+        self.scopes.pop()
+
+    def visit_Compound(self, node):
+        self.scopes.append({})
+        for item in node.block_items or []:
+            self.visit(item)
+        self.scopes.pop()
 
     def visit_Decl(self, node):
-        if is_integer_rank_type(node.type):
-            var_name = node.name
-            if var_name and var_name.startswith('old_rank'):
-                self.old_ranks.append((var_name, node))
-            elif var_name and var_name.startswith('new_rank'):
-                if node.init:
-                    norm_expr = ExpressionNormalizer().normalize(node.init)
-                    self.new_ranks_init[var_name] = norm_expr
-                else:
-                    self.new_ranks_declared.add(var_name)   # 记录待匹配
+        if node.name and node.name.startswith('new_rank') and node.init is not None:
+            self.check_expr(node.init)
+        self.declare(node.name, node)
+
+    def visit_Assignment(self, node):
+        if isinstance(node.lvalue, c_ast.ID) and node.lvalue.name.startswith('new_rank'):
+            self.check_expr(node.rvalue)
+        self.generic_visit(node)
+
+
+GHOST_NAME_RE = re.compile(r'^(old_rank|new_rank)(\d+)$')
+
+
+class RankDeclScanner(c_ast.NodeVisitor):
+    """Collect ghost declarations together with whether they sit inside the loop body."""
+
+    def __init__(self, loop_node):
+        self.loop_node = loop_node
+        self.in_loop = 0
+        self.decls = []
+
+    def _visit_loop(self, node):
+        if node is self.loop_node:
+            self.in_loop += 1
+            body = node.stmt
+            if isinstance(body, c_ast.Compound):
+                for item in body.block_items or []:
+                    self.visit(item)
+            elif body is not None:
+                self.visit(body)
+            self.in_loop -= 1
+        else:
+            self.generic_visit(node)
+
+    def visit_While(self, node):
+        self._visit_loop(node)
+
+    def visit_For(self, node):
+        self._visit_loop(node)
+
+    def visit_DoWhile(self, node):
+        self._visit_loop(node)
+
+    def visit_Decl(self, node):
+        if node.name and node.name.startswith(('old_rank', 'new_rank')):
+            self.decls.append((node.name, node, self.in_loop > 0))
+        self.generic_visit(node)
+
+
+def _unsupported(msg):
+    return 8, {'errors': [msg], 'inf': msg}
+
+
+class GuardPurityChecker(c_ast.NodeVisitor):
+    def __init__(self):
+        self.errors = []
+
+    def visit_Assignment(self, node):
+        self.errors.append('loop guard contains an assignment')
+
+    def visit_FuncCall(self, node):
+        name = node.name.name if isinstance(node.name, c_ast.ID) else '<call>'
+        self.errors.append("loop guard calls '%s'; guards must be pure expressions" % name)
+
+    def visit_UnaryOp(self, node):
+        if node.op in ('p++', 'p--', '++', '--'):
+            self.errors.append('loop guard contains increment/decrement')
+            return
+        if node.expr is not None:
+            self.visit(node.expr)
+
+    def visit_BinaryOp(self, node):
+        if node.op == ',':
+            self.errors.append('loop guard contains a comma expression')
+        self.generic_visit(node)
+
+
+class LoopControlFlowChecker(c_ast.NodeVisitor):
+    def __init__(self):
+        self.errors = []
+
+    def visit_While(self, node):
+        self.errors.append('nested while loop inside the loop body')
+        self.generic_visit(node)
+
+    def visit_For(self, node):
+        self.errors.append('nested for loop inside the loop body')
+        self.generic_visit(node)
+
+    def visit_DoWhile(self, node):
+        self.errors.append('nested do-while loop inside the loop body')
+        self.generic_visit(node)
+
+    def visit_Goto(self, node):
+        self.errors.append('goto statement inside the loop body')
+
+    def visit_Label(self, node):
+        self.errors.append('label inside the loop body')
+
+
+class BodyDeclNameCollector(c_ast.NodeVisitor):
+    def __init__(self):
+        self.names = []
+
+    def visit_Decl(self, node):
+        if node.name and not node.name.startswith(('old_rank', 'new_rank')):
+            self.names.append(node.name)
+        self.generic_visit(node)
+
+
+def _contains_node(node, target):
+    if node is target:
+        return True
+    for _, child in node.children():
+        if _contains_node(child, target):
+            return True
+    return False
+
+
+def collect_outer_names(ast, loop_node):
+    """Names visible from outside the loop (globals, params, enclosing blocks)."""
+    names = set()
+
+    class Visitor(c_ast.NodeVisitor):
+        def _maybe_descend(self, node):
+            if node is loop_node:
+                return
+            self.generic_visit(node)
+
+        def visit_While(self, node):
+            self._maybe_descend(node)
+
+        def visit_For(self, node):
+            self._maybe_descend(node)
+
+        def visit_DoWhile(self, node):
+            self._maybe_descend(node)
+
+        def visit_Decl(self, node):
+            if node.name and not node.name.startswith(('old_rank', 'new_rank')):
+                names.add(node.name)
+            self.generic_visit(node)
+
+        def visit_FuncDef(self, node):
+            if not _contains_node(node, loop_node):
+                return
+            args = node.decl.type.args
+            if args is not None:
+                for param in args.params:
+                    if param.name:
+                        names.add(param.name)
+            self.generic_visit(node)
+
+    Visitor().visit(ast)
+    return names
+
+
+class OutsideNewRankAssignments(c_ast.NodeVisitor):
+    def __init__(self, loop_node):
+        self.loop_node = loop_node
+        self.errors = []
+
+    def _maybe_descend(self, node):
+        if node is self.loop_node:
+            return
         self.generic_visit(node)
 
     def visit_While(self, node):
-        self.in_loop = True
-        self.generic_visit(node)
-        self.in_loop = False
+        self._maybe_descend(node)
+
+    def visit_For(self, node):
+        self._maybe_descend(node)
+
+    def visit_DoWhile(self, node):
+        self._maybe_descend(node)
 
     def visit_Assignment(self, node):
-        if isinstance(node.lvalue, c_ast.ID):
-            lhs = node.lvalue.name
-            # 在循环体之前，若遇到对 new_rank 的赋值且尚未记录初始化表达式，则捕获
-            if not self.in_loop and lhs in self.new_ranks_declared:
-                if lhs not in self.new_ranks_init:
-                    norm_expr = ExpressionNormalizer().normalize(node.rvalue)
-                    self.new_ranks_init[lhs] = norm_expr
-                    print(f"[DEBUG] Found new_rank variable (via assignment): {lhs} = {norm_expr}")
-            # 原有逻辑：记录所有 rank 相关赋值（用于后续检查）
-            if lhs and (lhs.startswith('old_rank') or lhs.startswith('new_rank')):
-                self.assignments.append((lhs, node.rvalue, node))
+        if isinstance(node.lvalue, c_ast.ID) and node.lvalue.name.startswith('new_rank'):
+            self.errors.append(
+                'new_rank must be assigned only by the updates at the end of the loop body'
+            )
         self.generic_visit(node)
+
+
+def _contiguous_indices(names, prefix):
+    indices = []
+    for name in names:
+        match = re.match(r'^%s(\d+)$' % prefix, name)
+        if match is None:
+            return None
+        indices.append(int(match.group(1)))
+    if not indices or sorted(indices) != list(range(1, len(indices) + 1)):
+        return None
+    return len(indices)
+
+
+def check_rank_layout(ast, loop_node):
+    """Check ghost declaration/update layout. Returns (status, info) or (None, None)."""
+    body = loop_node.stmt
+    if not isinstance(body, c_ast.Compound):
+        return _unsupported('the loop body must be a braced compound statement')
+    items = body.block_items or []
+
+    scanner = RankDeclScanner(loop_node)
+    scanner.visit(ast)
+    in_body = [name for name, _, inside in scanner.decls if inside]
+    if in_body:
+        return 4, {'errors': [
+            'ghost declarations must appear before the loop; found inside the loop body: %s'
+            % ', '.join(sorted(set(in_body)))], 'inf': 'ghost declaration inside loop body'}
+
+    old_decls = [(name, node) for name, node, _ in scanner.decls if name.startswith('old_rank')]
+    new_decls = [(name, node) for name, node, _ in scanner.decls if name.startswith('new_rank')]
+    old_names = [name for name, _ in old_decls]
+    new_names = [name for name, _ in new_decls]
+
+    if not old_names and not new_names:
+        return 2, {'inf': "Missing required rank variable declarations. "
+                           "Expected old_rank1..n and new_rank1..n."}
+    n_old = _contiguous_indices(old_names, 'old_rank')
+    n_new = _contiguous_indices(new_names, 'new_rank')
+    if n_old is None or n_new is None or n_old != n_new:
+        return 2, {'old_count': len(old_names), 'new_count': len(new_names),
+                   'count': len(old_names), 'old_vars': old_names, 'new_vars': new_names,
+                   'inf': 'Rank variables must be declared exactly as old_rank1..n and new_rank1..n'}
+    n = n_old
+
+    for name, node in old_decls + new_decls:
+        if not is_integer_rank_type(node.type):
+            return 4, {'errors': [
+                "rank variable '%s' must have an integer scalar type (int/long)" % name],
+                'inf': 'non-integer ghost declaration'}
+    for name, node in new_decls:
+        if node.init is None:
+            return 4, {'errors': [
+                "new_rank variable '%s' must be initialized in its declaration" % name],
+                'inf': 'uninitialized new_rank declaration'}
+
+    snapshot_errors = []
+    for i in range(n):
+        expected_old = 'old_rank%d' % (i + 1)
+        expected_new = 'new_rank%d' % (i + 1)
+        stmt = items[i] if i < len(items) else None
+        if not (isinstance(stmt, c_ast.Assignment)
+                and isinstance(stmt.lvalue, c_ast.ID)
+                and stmt.lvalue.name == expected_old
+                and isinstance(stmt.rvalue, c_ast.ID)
+                and stmt.rvalue.name == expected_new):
+            snapshot_errors.append(
+                'the loop body must start with %s = %s; (snapshots in order, one per rank)'
+                % (expected_old, expected_new))
+    for index, stmt in enumerate(items):
+        if (isinstance(stmt, c_ast.Assignment) and isinstance(stmt.lvalue, c_ast.ID)
+                and stmt.lvalue.name.startswith('old_rank') and index >= n):
+            snapshot_errors.append(
+                'old_rank variables may only be assigned by the leading snapshots')
+    if snapshot_errors:
+        return 3, {'errors': snapshot_errors, 'count': n, 'inf': snapshot_errors[0]}
+
+    outside = OutsideNewRankAssignments(loop_node)
+    outside.visit(ast)
+    if outside.errors:
+        return 4, {'errors': outside.errors, 'inf': outside.errors[0]}
+
+    init_expr = {name: ExpressionNormalizer().normalize(node.init) for name, node in new_decls}
+
+    update_errors = []
+    if len(items) < n:
+        update_errors.append('the loop body is too short to contain %d new_rank updates' % n)
+    else:
+        for i in range(n):
+            expected = 'new_rank%d' % (i + 1)
+            stmt = items[len(items) - n + i]
+            if not (isinstance(stmt, c_ast.Assignment)
+                    and isinstance(stmt.lvalue, c_ast.ID)
+                    and stmt.lvalue.name == expected):
+                update_errors.append(
+                    'the last %d statements of the loop body must be new_rank1 = e1; ... '
+                    'new_rank%d = e%d; (missing or out-of-order %s)' % (n, n, n, expected))
+                continue
+            actual = ExpressionNormalizer().normalize(stmt.rvalue)
+            if actual != init_expr.get(expected):
+                update_errors.append(
+                    "%s update expression mismatch: initialization='%s', loop='%s'"
+                    % (expected, init_expr.get(expected), actual))
+    for index, stmt in enumerate(items):
+        if (isinstance(stmt, c_ast.Assignment) and isinstance(stmt.lvalue, c_ast.ID)
+                and stmt.lvalue.name.startswith('new_rank') and index < len(items) - n):
+            update_errors.append(
+                'new_rank updates must be the last %d statements of the loop body' % n)
+    if update_errors:
+        return 4, {'errors': update_errors, 'count': n, 'inf': update_errors[0]}
+
+    return None, None
 
 class LoopLocator(c_ast.NodeVisitor):
     """Locate the first while loop in the program (the problem guarantees a single loop)"""
@@ -101,7 +455,7 @@ class LoopLocator(c_ast.NodeVisitor):
         # Capture the first while encountered (the problem guarantees a single loop)
         if self.target_loop is None:
             self.target_loop = node
-            print("[DEBUG] Captured the first while loop node (program contains only a single loop)")
+            print("[DEBUG] ✅ Captured the first while loop node (program contains only a single loop)")
         # Regardless of capture, skip traversing the loop body (saves overhead and avoids nested interference)
         return  # do not call generic_visit
     def visit_For(self, node):
@@ -113,124 +467,37 @@ class LoopLocator(c_ast.NodeVisitor):
 
 
 # ==================== Core Checking Logic ====================
-def split_loop_body(loop_node):
-    if isinstance(loop_node.stmt, c_ast.Compound):
-        body_stmts = loop_node.stmt.block_items or []
-    else:
-        body_stmts = [loop_node.stmt] if loop_node.stmt else []
+def preprocess_c_code(c_code, verbose=True):
+    if verbose:
+        print("\n[Step] Preprocessing C code: remove preprocessor directives + all comments")
+        print(f"  Original code lines: {len(c_code.splitlines())}")
 
-    begin_part, end_part = [], []
-    in_begin = True
-
-    for stmt in body_stmts:
-        # 判断是否为 old_rank = ... 的赋值
-        is_old_rank_assign = (
-            isinstance(stmt, c_ast.Assignment) and 
-            isinstance(stmt.lvalue, c_ast.ID) and
-            stmt.lvalue.name.startswith('old_rank')
-        )
-        if in_begin and is_old_rank_assign:
-            begin_part.append(stmt)
-        else:
-            in_begin = False
-            end_part.append(stmt)
-
-    if isinstance(loop_node, c_ast.For) and loop_node.next:
-        end_part.append(loop_node.next)
-
-    return begin_part, end_part
-
-def check_old_rank_assignments(begin_part, old_ranks, new_ranks):
-    assign_map = {}
-    gen = CGenerator()
-    for stmt in begin_part:
-        if isinstance(stmt, c_ast.Assignment) and isinstance(stmt.rvalue, c_ast.ID):
-            assign_map[stmt.lvalue.name] = stmt.rvalue.name
-            print(f"[DEBUG] Loop start assignment: {stmt.lvalue.name} = {stmt.rvalue.name}")
-    
-    errors = []
-    print(f"\n[Check] Verifying loop start assignments (total {len(old_ranks)} old_rank variables):")
-    for i, (old_var, _) in enumerate(old_ranks):
-        if i >= len(new_ranks):
-            break
-        expected_new = new_ranks[i][0]
-        actual = assign_map.get(old_var)
-        status = "✓" if actual == expected_new else "✗"
-        print(f"  {status} {old_var}: expected = {expected_new}, actual = {actual if actual else 'not assigned'}")
-        if actual != expected_new:
-            errors.append(f"Expected {old_var} = {expected_new}, got {old_var} = {actual or '?'}")
-    return errors
-
-def check_new_rank_updates(end_part, new_ranks_init):
-    updates = {}
-    gen = CGenerator()
-    for stmt in end_part:
-        if (isinstance(stmt, c_ast.Assignment) and 
-            isinstance(stmt.lvalue, c_ast.ID) and
-            stmt.lvalue.name in new_ranks_init):
-            var = stmt.lvalue.name
-            expr_norm = ExpressionNormalizer().normalize(stmt.rvalue)
-            updates.setdefault(var, []).append(expr_norm)
-            print(f"[DEBUG] Update inside loop: {var} = {expr_norm}")
-    
-    errors = []
-    print(f"\n[Check] Verifying new_rank update expression consistency (total {len(new_ranks_init)} variables):")
-    for var, init_expr in new_ranks_init.items():
-        print(f"\n  Variable: {var}")
-        print(f"    Initialization expression: {init_expr}")
-        if var not in updates:
-            print(f"    ✗ No update found inside loop body!")
-            errors.append(f"{var} is not updated inside the loop body")
-        elif len(updates[var]) > 1:
-            print(f"    ✗ Updated {len(updates[var])} times (should be exactly 1)")
-            errors.append(f"{var} is updated multiple times")
-        else:
-            update_expr = updates[var][0]
-            match = "✓" if update_expr == init_expr else "✗"
-            print(f"    Loop update expression: {update_expr} {match}")
-            if update_expr != init_expr:
-                errors.append(f"{var} update expression mismatch: initialization='{init_expr}', loop='{update_expr}'")
-    return errors
-
-def preprocess_c_code(c_code):
-    print("\n[Step] Preprocessing C code: remove preprocessor directives + all comments")
-    print(f"  Original code lines: {len(c_code.splitlines())}")
-    
     # 1. Remove all preprocessor directives (#include, #define, etc.)
     c_code = re.sub(r'^\s*#.*$', '', c_code, flags=re.MULTILINE)
-    print(f"  → Lines after removing preprocessor directives: {len(c_code.splitlines())}")
-    
+
     # 2. Thoroughly remove all C comments (block comments + line comments)
     def remove_c_comments(text):
         text = re.sub(r'/\*.*?\*/', '', text, flags=re.DOTALL)
         text = re.sub(r'//.*?$', '', text, flags=re.MULTILINE)
         return text
-    
+
     c_code = remove_c_comments(c_code)
-    print(f"  → Lines after removing all comments: {len(c_code.splitlines())}")
-    
+
     # 3. Clean up leftover whitespace and blank lines
     c_code = re.sub(r'[ \t]+$', '', c_code, flags=re.MULTILINE)
     c_code = re.sub(r'\n\s*\n', '\n\n', c_code)
     c_code = c_code.strip() + '\n'
-    print(f"  → Lines after cleaning whitespace/blank lines: {len(c_code.splitlines())}")
-    
-    # 4. Print key snippet after preprocessing (verify comments are cleaned)
-    snippet_lines = c_code.strip().split('\n')[:15]
-    print("\n[DEBUG] First 15 lines after preprocessing (verify no # or //):")
-    for i, line in enumerate(snippet_lines, 1):
-        if '#' in line or '//' in line or '/*' in line:
-            print(f"  {i:2d}. [!] {line[:70]}")
-        else:
-            print(f"  {i:2d}.     {line[:70]}")
-    print(f"\n[DEBUG] Preprocessing done, ready for AST parsing")
+
+    if verbose:
+        print(f"  → Lines after preprocessing: {len(c_code.splitlines())}")
+        print("  → Preprocessing done, ready for AST parsing")
     return c_code
 
 def check_rank_consistency(c_code, guard_input = "", verbose=False):
     # ============ [Core change] Completely ignore guard_input, directly locate the only loop ============
     print("="*60)
-    print(" Starting rank consistency check | Strategy: locate the first while loop in the program (single loop)")
-    print(f"[INFO]  Ignoring guard parameter: '{guard_input}' (program contains only one while loop)")
+    print("🔍 Starting rank consistency check | Strategy: locate the first while loop in the program (single loop)")
+    print(f"[INFO] ℹ️  Ignoring guard parameter: '{guard_input}' (program contains only one while loop)")
     print("="*60)
     
     # Preprocess
@@ -253,65 +520,73 @@ def check_rank_consistency(c_code, guard_input = "", verbose=False):
     loop_node = locator.get_loop()
     
     if loop_node is None:
-        print("[ERROR] No while loop node found")
+        print("[ERROR] ❌ No while loop node found")
         return 5, "No while loop exists in AST (please confirm the code contains a loop structure)"
     print("[DEBUG] ✓ Successfully located target loop node")
     # ======================================================================
     
-    # Extract variables
-    print("\n[Step] Extracting rank-related variables...")
-    extractor = RankExtractor()
-    extractor.visit(ast)
-    old_ranks = extractor.old_ranks
-    new_ranks = [(name, None) for name in extractor.new_ranks_init.keys()]
-    
-    print(f"\n[Statistics] Extraction results:")
-    print(f"  old_rank variables ({len(old_ranks)}): {[n for n,_ in old_ranks]}")
-    print(f"  new_rank variables ({len(new_ranks)}): {list(extractor.new_ranks_init.keys())}")
-    if len(old_ranks) == 0 and len(new_ranks) == 0:
-        print("[ERROR] No rank variables (old_rank / new_rank) found in the program.")
-        return 2, {
-            'inf': "Missing required rank variable declarations. Expected at least one old_rank and one new_rank variable."
-        }
-    if len(old_ranks) != len(new_ranks):
-        print(f"[ERROR] Variable count mismatch! old={len(old_ranks)}, new={len(new_ranks)}")
-        return 2, {
-            'old_count': len(old_ranks),
-            'new_count': len(new_ranks),
-            'count': len(old_ranks),
-            'old_vars': [n for n, _ in old_ranks],
-            'new_vars': [n for n, _ in new_ranks],
-            'inf': f"[ERROR] Variable count mismatch! old={len(old_ranks)}, new={len(new_ranks)}"
-        }
-    
-    # Split loop body
-    print("\n[Step] Splitting loop body statements...")
-    begin_part, end_part = split_loop_body(loop_node)
-    
-    # Check 1: Loop start assignments
-    print("\n[Step] Checking loop start assignments (old_rank = new_rank)...")
-    errors_start = check_old_rank_assignments(begin_part, old_ranks, new_ranks)
-    if errors_start:
-        print(f"\n[✗] Loop start assignment check failed ({len(errors_start)} errors)")
-        return 3, {'errors': errors_start, 'count': len(old_ranks),
-            'inf': f"Loop start assignment check failed ({len(errors_start)} errors)"}
+    # Check 0: Ranking-expression purity
+    print("\n[Step] Checking ranking-expression purity...")
+    grammar_collector = RankingExpressionCollector()
+    grammar_collector.visit(ast)
+    if grammar_collector.errors:
+        print(f"\n[✗] Ranking-expression purity check failed ({len(grammar_collector.errors)} errors)")
+        for error in grammar_collector.errors:
+            print(f"  - {error}")
+        return 7, {'errors': grammar_collector.errors,
+            'inf': f"Ranking-expression purity check failed ({len(grammar_collector.errors)} errors)"}
+    print("[✓] Ranking-expression purity check passed")
+
+    # Check 1: supported fragment (pure guard, no nested loops / goto / labels, braced body)
+    print("\n[Step] Checking supported program fragment...")
+    unsupported_errors = []
+    if loop_node.cond is not None:
+        guard_checker = GuardPurityChecker()
+        guard_checker.visit(loop_node.cond)
+        unsupported_errors.extend(guard_checker.errors)
+    if not isinstance(loop_node.stmt, c_ast.Compound):
+        unsupported_errors.append('the loop body must be a braced compound statement')
     else:
-        print("[✓] Loop start assignment check passed")
-    
-    # Check 2: Update expression consistency
-    print("\n[Step] Checking new_rank update expression consistency...")
-    errors_update = check_new_rank_updates(end_part, extractor.new_ranks_init)
-    if errors_update:
-        print(f"\n[✗] Update expression check failed ({len(errors_update)} errors)")
-        return 4, {'errors': errors_update, 'count': len(old_ranks),
-            'inf': f"Update expression check failed ({len(errors_update)} errors)"}
-    else:
-        print("[✓] Update expression consistency check passed")
-    
+        control_checker = LoopControlFlowChecker()
+        for item in loop_node.stmt.block_items or []:
+            control_checker.visit(item)
+        unsupported_errors.extend(control_checker.errors)
+    if unsupported_errors:
+        print(f"\n[✗] Unsupported program feature ({len(unsupported_errors)} errors)")
+        for error in unsupported_errors:
+            print(f"  - {error}")
+        return 8, {'errors': unsupported_errors, 'inf': unsupported_errors[0]}
+
+    # Check 2: local declarations inside the loop body must not shadow outer variables
+    if isinstance(loop_node.stmt, c_ast.Compound):
+        outer_names = collect_outer_names(ast, loop_node)
+        decl_collector = BodyDeclNameCollector()
+        for item in loop_node.stmt.block_items or []:
+            decl_collector.visit(item)
+        shadow_errors = ['loop body redeclares outer variable \'%s\'' % name
+                         for name in decl_collector.names if name in outer_names]
+        if shadow_errors:
+            print(f"\n[✗] Shadowing inside loop body ({len(shadow_errors)} errors)")
+            for error in shadow_errors:
+                print(f"  - {error}")
+            return 8, {'errors': shadow_errors, 'inf': shadow_errors[0]}
+    print("[✓] Supported program fragment check passed")
+
+    # Check 3: ghost layout (declarations, snapshots, final updates, expression consistency)
+    print("\n[Step] Checking ghost declaration and update layout...")
+    layout_status, layout_info = check_rank_layout(ast, loop_node)
+    if layout_status is not None:
+        print(f"\n[✗] Ghost layout check failed (status {layout_status})")
+        for error in layout_info.get('errors', [layout_info.get('inf', '')]):
+            print(f"  - {error}")
+        return layout_status, layout_info
+    print("[✓] Ghost layout check passed")
+
+    count = len(RankDeclScanner(loop_node).decls) // 2
     print("\n" + "="*60)
-    print(" All checks passed! Rank update logic conforms to verification specification")
+    print("✅ All checks passed! Rank update logic conforms to verification specification")
     print("="*60)
-    return 1, {'count': len(old_ranks)}
+    return 1, {'count': count}
 
 # ==================== CLI Entry ====================
 def get_c_files(directory):
@@ -348,21 +623,21 @@ Note: The guard parameter is completely ignored in batch mode because the progra
     
     # Validate directory existence
     if not os.path.exists(args.dir_path):
-        print(f" Error: Path '{args.dir_path}' does not exist", file=sys.stderr)
+        print(f"❌ Error: Path '{args.dir_path}' does not exist", file=sys.stderr)
         sys.exit(11)
     if not os.path.isdir(args.dir_path):
-        print(f" Error: '{args.dir_path}' is not a directory", file=sys.stderr)
+        print(f"❌ Error: '{args.dir_path}' is not a directory", file=sys.stderr)
         sys.exit(12)
     
     # Get list of C files
     try:
         c_files = get_c_files(args.dir_path)
     except Exception as e:
-        print(f" Directory scan failed: {e}", file=sys.stderr)
+        print(f"❌ Directory scan failed: {e}", file=sys.stderr)
         sys.exit(13)
     
     if not c_files:
-        print(f"  Warning: No .c files found in directory '{args.dir_path}'")
+        print(f"⚠️  Warning: No .c files found in directory '{args.dir_path}'")
         sys.exit(0)
     
     print(f"📁 Scanning directory: {os.path.abspath(args.dir_path)}")
@@ -371,30 +646,32 @@ Note: The guard parameter is completely ignored in batch mode because the progra
     # Result storage: [(filename, status, details)]
     results = []
     STATUS_MSG = {
-        1: (" PASS", "All rank variable update logic conforms to specification"),
-        2: (" Variable count mismatch", "old_rank and new_rank counts are inconsistent"),
-        3: (" Loop start assignment error", "old_rank did not correctly preserve previous new_rank value"),
-        4: (" Update expression inconsistency", "new_rank update logic inside loop does not match initialization"),
-        5: (" Target loop not found", "No while loop exists in AST"),
-        6: (" AST parsing failed", "C code syntax error or contains unsupported syntax"),
-        10: (" File read failure", "Cannot read source file")
+        1: ("✅ PASS", "All rank variable update logic conforms to specification"),
+        2: ("❌ Variable count mismatch", "old_rank and new_rank counts are inconsistent"),
+        3: ("❌ Loop start assignment error", "old_rank did not correctly preserve previous new_rank value"),
+        4: ("❌ Update expression inconsistency", "new_rank update logic inside loop does not match initialization"),
+        7: ("❌ Ranking-expression purity violation", "Ranking expression contains a disallowed construct"),
+        8: ("❌ Unsupported program feature", "Guard/control-flow construct outside the supported fragment"),
+        5: ("❌ Target loop not found", "No while loop exists in AST"),
+        6: ("❌ AST parsing failed", "C code syntax error or contains unsupported syntax"),
+        10: ("❌ File read failure", "Cannot read source file")
     }
     
     # Analyze each file
     for idx, filename in enumerate(c_files, 1):
         filepath = os.path.join(args.dir_path, filename)
         print(f"\n{'='*70}")
-        print(f" [{idx}/{len(c_files)}] Analyzing: {filename}")
+        print(f"🔍 [{idx}/{len(c_files)}] Analyzing: {filename}")
         print(f"{'='*70}")
         
         # Read file content
         try:
             with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
                 c_code = f.read()
-            print(f" File size: {len(c_code)} characters")
+            print(f"📄 File size: {len(c_code)} characters")
         except Exception as e:
             err_msg = f"File read exception: {str(e)}"
-            print(f" {err_msg}")
+            print(f"❌ {err_msg}")
             results.append((filename, 10, err_msg))
             continue
         
@@ -403,13 +680,13 @@ Note: The guard parameter is completely ignored in batch mode because the progra
             status, details = check_rank_consistency(c_code, args.guard, verbose=args.verbose)
         except Exception as e:
             status, details = 7, f"Check process exception: {str(e)}"
-            print(f"  Unexpected error during check: {e}")
+            print(f"⚠️  Unexpected error during check: {e}")
         
         results.append((filename, status, details))
     
     # ===== Generate summary report =====
     print("\n" + "="*70)
-    print(" Batch Check Summary Report")
+    print("📊 Batch Check Summary Report")
     print("="*70)
     
     # Group by status
@@ -422,23 +699,23 @@ Note: The guard parameter is completely ignored in batch mode because the progra
     passed = len(stats[1])
     failed = total - passed
     
-    print(f"\n PASS: {passed} files")
+    print(f"\n✅ PASS: {passed} files")
     if stats[1]:
         for f in stats[1]:
             print(f"   • {f}")
     
-    print(f"\n FAIL: {failed} files")
+    print(f"\n❌ FAIL: {failed} files")
     for status_code in sorted(stats.keys()):
         if status_code == 1 or not stats[status_code]:  # skip PASS and empty entries
             continue
-        symbol, desc = STATUS_MSG.get(status_code, ("", "Unknown error"))
+        symbol, desc = STATUS_MSG.get(status_code, ("⚠️", "Unknown error"))
         print(f"\n{symbol} {desc} ({len(stats[status_code])} files):")
         for f in stats[status_code]:
             print(f"   • {f}")
     
     # Final statistics
     print("\n" + "="*70)
-    print(f" Total: {total} files | PASS: {passed} | FAIL: {failed}")
+    print(f"📈 Total: {total} files | PASS: {passed} | FAIL: {failed}")
     print("="*70)
     
     # Exit code: 0 if all passed, 1 if any failed
@@ -449,7 +726,7 @@ if __name__ == '__main__':
     try:
         import pycparser
     except ImportError:
-        print(" Missing dependency: please install pycparser", file=sys.stderr)
+        print("❌ Missing dependency: please install pycparser", file=sys.stderr)
         print("   Run: pip install pycparser", file=sys.stderr)
         sys.exit(1)
     main()

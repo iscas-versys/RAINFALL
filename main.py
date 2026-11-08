@@ -12,14 +12,18 @@ import json
 import argparse
 import subprocess
 from subprocess import TimeoutExpired
-from static_check.codeChecker import check_rank_consistency
+from static_check.codeChecker import check_rank_consistency, preprocess_c_code
 from static_check.rankingChecker import validate_c_file
 from static_check.astChecker import check_AST
+from pycparser import c_parser
 from utils import *
 from prompt import *
 import clang
 from clang.cindex import Index, CursorKind
 api_key = ""
+
+OFOX_IPS = ["8.218.173.249", "47.83.190.88", "47.83.144.71", "47.76.128.166"]
+OFOX_PROXY = "socks5://172.17.0.1:17891"
 
 SPEC_FILE = "SpecLoC.txt"
 llm_model = ""
@@ -78,16 +82,84 @@ def analyze_with_llm(iterate_prompt, max_tokens = 5000):
             "model": llm_model,
             "reasoning": {"enabled": True},
             "messages": [{"role": "user", "content": iterate_prompt}],
-            "temperature": 0.2,  
+            "temperature": 0.2,
             "enable_thinking":True
         }
+    if platform == "oxoai":
+        payload = {
+            "model": llm_model,
+            "messages": [{"role": "user", "content": iterate_prompt}],
+            "temperature": 0.0,
+        }
     try:
-        start_time = time.time()  
+        start_time = time.time()
+        if platform == "oxoai":
+            from curl_cffi import requests as cffi_requests, CurlOpt
+            stream_payload = dict(payload, stream=True,
+                                  stream_options={"include_usage": True})
+            last_err = None
+            for ip in OFOX_IPS:
+                chunks = []
+                input_tokens = output_tokens = 0
+                try:
+                    resp = cffi_requests.post(
+                        url=url,
+                        headers=headers,
+                        data=json.dumps(stream_payload),
+                        impersonate="chrome",
+                        proxies={"http": OFOX_PROXY, "https": OFOX_PROXY},
+                        curl_options={CurlOpt.RESOLVE: ["api.ofox.ai:443:" + ip],
+                                      CurlOpt.LOW_SPEED_LIMIT: 1,
+                                      CurlOpt.LOW_SPEED_TIME: 45},
+                        timeout=900,
+                        stream=True,
+                    )
+                    if resp.status_code != 200:
+                        last_err = "status %d on %s: %s" % (
+                            resp.status_code, ip, resp.text[:300])
+                        continue
+                    last_data = time.time()
+                    for line in resp.iter_lines():
+                        if not line:
+                            continue
+                        text = line.decode() if isinstance(line, bytes) else line
+                        if not text.startswith("data: "):
+                            if time.time() - last_data > 120:
+                                raise RuntimeError("no tokens for 120s")
+                            continue
+                        last_data = time.time()
+                        text = text[6:].strip()
+                        if text == "[DONE]":
+                            break
+                        try:
+                            event = json.loads(text)
+                        except json.JSONDecodeError:
+                            continue
+                        if event.get("usage"):
+                            usage = event["usage"]
+                            input_tokens = usage.get("prompt_tokens", input_tokens) or input_tokens
+                            output_tokens = usage.get("completion_tokens", output_tokens) or output_tokens
+                        choices = event.get("choices") or []
+                        if choices:
+                            delta = choices[0].get("delta") or {}
+                            if delta.get("content"):
+                                chunks.append(delta["content"])
+                    call_time = time.time() - start_time
+                    content = "".join(chunks)
+                    think_end = content.rfind("</think>")
+                    if think_end != -1:
+                        content = content[think_end + len("</think>"):]
+                    return content, input_tokens, output_tokens, call_time
+                except Exception as e:
+                    last_err = "%s on %s" % (e, ip)
+                    continue
+            print(f"Request failed: {last_err}")
+            return None, 0, 0, 0.0
         response = requests.post(
             url=url,
             headers=headers,
-            data=json.dumps(payload),  
-            timeout=300 
+            data=json.dumps(payload),
+            timeout=300
         )
         end_time = time.time()  
         call_time = end_time - start_time  
@@ -117,6 +189,11 @@ def analyze_with_llm(iterate_prompt, max_tokens = 5000):
         print("JSON parsing failed")
         print("Raw response:", response.text)
         return None,0,0,0.0
+    except Exception as e:
+        if platform == "oxoai":
+            print(f"Request failed: {str(e)}")
+            return None,0,0,0.0
+        raise
 
 def call_llm_with_retry(prompt, max_retries=3, **kwargs):
     for attempt in range(max_retries):
@@ -127,6 +204,222 @@ def call_llm_with_retry(prompt, max_retries=3, **kwargs):
         time.sleep(2 ** attempt)  
     print("Max retries exhausted, abandoning this call")
     return None, 0, 0, 0.0   
+
+GHOST_IDENTIFIER_RE = re.compile(r'\b(?:old_rank|new_rank)\w*')
+
+
+def original_has_ghost_identifiers(path):
+    """The input program must not already use the reserved ghost names."""
+    try:
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            code = f.read()
+    except OSError:
+        return False
+    code = re.sub(r'/\*.*?\*/', '', code, flags=re.DOTALL)
+    code = re.sub(r'//.*?$', '', code, flags=re.MULTILINE)
+    return bool(GHOST_IDENTIFIER_RE.search(code))
+
+
+def validate_candidate(original_path, candidate_text, scratch_path):
+    """Run every static check on the same candidate text.
+
+    Returns (ok, stage, payload). stage is one of ok/unsupported/code/ast/assert.
+    """
+    if original_has_ghost_identifiers(original_path):
+        return False, 'unsupported', {
+            'inf': 'The input program already uses old_rank/new_rank identifiers.'
+        }
+    try:
+        with open(scratch_path, 'w', encoding='utf-8') as f:
+            f.write(candidate_text)
+    except OSError as exc:
+        return False, 'unsupported', {'inf': 'Cannot write candidate: %s' % exc}
+
+    status, info = check_rank_consistency(candidate_text)
+    if status in (5, 6, 8):
+        return False, 'unsupported', {'status': status, 'info': info}
+    if status != 1:
+        return False, 'code', {'status': status, 'info': info}
+
+    ok, msg = check_AST(original_path, scratch_path)
+    if not ok:
+        return False, 'ast', {'msg': msg}
+
+    ok, msg = validate_c_file(candidate_text)
+    if not ok:
+        return False, 'assert', {'msg': msg}
+
+    count = info.get('count', 1) if isinstance(info, dict) else 1
+    return True, 'ok', {'count': count}
+
+
+def _mask_c(text):
+    """Replace comments, string/char literals, and directive lines with spaces."""
+    out = list(text)
+    i, n = 0, len(text)
+    line_start = True
+    while i < n:
+        ch = text[i]
+        if ch == '/' and i + 1 < n and text[i + 1] == '/':
+            while i < n and text[i] != '\n':
+                out[i] = ' '
+                i += 1
+            continue
+        if ch == '/' and i + 1 < n and text[i + 1] == '*':
+            out[i] = out[i + 1] = ' '
+            i += 2
+            while i < n and not (text[i] == '*' and i + 1 < n and text[i + 1] == '/'):
+                if text[i] != '\n':
+                    out[i] = ' '
+                i += 1
+            if i < n:
+                out[i] = out[i + 1] = ' '
+                i += 2
+            continue
+        if ch in ('"', "'"):
+            quote = ch
+            out[i] = ' '
+            i += 1
+            line_start = False
+            while i < n:
+                if text[i] == '\\':
+                    out[i] = ' '
+                    i += 1
+                    if i < n:
+                        if text[i] != '\n':
+                            out[i] = ' '
+                        i += 1
+                    continue
+                if text[i] == quote:
+                    out[i] = ' '
+                    i += 1
+                    break
+                if text[i] != '\n':
+                    out[i] = ' '
+                i += 1
+            continue
+        if ch == '#' and line_start:
+            while i < n and text[i] != '\n':
+                out[i] = ' '
+                i += 1
+            continue
+        if ch == '\n':
+            line_start = True
+        elif not ch.isspace():
+            line_start = False
+        i += 1
+    return ''.join(out)
+
+
+def _find_loop_body(masked):
+    """Return (start, end) of the first loop body's inner text, or None."""
+    match = re.search(r'\b(?:while|for)\s*\(', masked)
+    if not match:
+        return None
+    open_paren = masked.index('(', match.start())
+    depth = 0
+    close_paren = None
+    for i in range(open_paren, len(masked)):
+        ch = masked[i]
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+            if depth == 0:
+                close_paren = i
+                break
+    if close_paren is None:
+        return None
+    j = close_paren + 1
+    while j < len(masked) and masked[j].isspace():
+        j += 1
+    if j >= len(masked) or masked[j] != '{':
+        return None
+    depth = 0
+    for k in range(j, len(masked)):
+        if masked[k] == '{':
+            depth += 1
+        elif masked[k] == '}':
+            depth -= 1
+            if depth == 0:
+                return j + 1, k
+    return None
+
+
+def _pick_label(masked):
+    base = '__rainfall_continue'
+    label = base
+    suffix = 0
+    while re.search(r'\b%s\b' % re.escape(label), masked):
+        suffix += 1
+        label = '%s_%d' % (base, suffix)
+    return label
+
+
+def cover_continues(text, update_count):
+    """Rewrite `continue` to `goto label` and place the label before the final updates."""
+    masked = _mask_c(text)
+    body = _find_loop_body(masked)
+    if body is None:
+        return None, 'cannot locate a braced loop body'
+    label = _pick_label(masked)
+
+    start, end = body
+    edits = [(start + m.start(), start + m.end())
+             for m in re.finditer(r'\bcontinue\b', masked[start:end])]
+    if not edits:
+        return text, ''
+    for begin, finish in reversed(edits):
+        text = text[:begin] + 'goto %s' % label + text[finish:]
+
+    masked = _mask_c(text)
+    body = _find_loop_body(masked)
+    if body is None:
+        return None, 'cannot relocate the loop body after rewriting continue'
+
+    inner = text[body[0]:body[1]]
+    lines = inner.splitlines(keepends=True)
+    starts = []
+    position = body[0]
+    for line in lines:
+        starts.append(position)
+        position += len(line)
+
+    update_re = re.compile(r'^\s*new_rank\d+\s*=.*;\s*$')
+    seen = 0
+    target = None
+    for index in range(len(lines) - 1, -1, -1):
+        stripped = lines[index].strip()
+        if not stripped or stripped.startswith('//@'):
+            continue
+        if update_re.match(stripped):
+            seen += 1
+            target = starts[index]
+            if seen == update_count:
+                break
+        else:
+            break
+    if target is None or seen < update_count:
+        return None, 'cannot find the final %d new_rank update statements' % update_count
+
+    indent = re.match(r'[ \t]*', text[target:]).group(0)
+    text = text[:target] + indent + label + ': ;\n' + text[target:]
+
+    masked = _mask_c(text)
+    body = _find_loop_body(masked)
+    if body is None or re.search(r'\bcontinue\b', masked[body[0]:body[1]]):
+        return None, 'a continue statement is still present after rewriting'
+    return text, ''
+
+
+def syntax_ok(text):
+    try:
+        c_parser.CParser().parse(preprocess_c_code(text, verbose=False), filename='<candidate>')
+        return True
+    except Exception as exc:
+        print("Syntax check failed after instrumentation: %s" % exc)
+        return False
+
 
 def process_c_files(folder_path, llm_max, counter_max,output_dir="termination_results", ultimate_dir='/workspace/UltimateAutomizer-linux/UAutomizer-linux'):
     """
@@ -189,7 +482,6 @@ def process_c_files(folder_path, llm_max, counter_max,output_dir="termination_re
                 j = 0
                 jmax = counter_max+1
                 save_string_to_file(result +"\n",result_path + "/" + file_name)
-                #print("result:",result)
                 while j < jmax:
                     if result == "":
                         result_dict[file_name]=result_dict[file_name] +"_LLM_FALSE"+str(j)+" "
@@ -197,115 +489,97 @@ def process_c_files(folder_path, llm_max, counter_max,output_dir="termination_re
 
                     if j > 1:
                         print(f"Analysis attempt {j-1}:")
-                   # -------------------------------- AST CHECK --------------------------------
-                    print("check_AST start.")
-                    while True:
-                        _bAST,msg = check_AST(file_path,result_path + "/" + file_name)
 
-                        if _bAST == False:
-                            result_dict[file_name] = result_dict[file_name] + "_AST_FALSE"+str(j)+" "
-                            j = j+1
-                            if j >= jmax:
-                                break
+                    scratch_path = result_path + "/" + file_name
+                    ok_candidate, stage, payload = validate_candidate(file_path, result, scratch_path)
+                    if not ok_candidate:
+                        if stage == 'unsupported':
+                            if payload.get('status') in (5, 6):
+                                result_dict[file_name] = (result_dict[file_name]
+                                                          + "_LLM_FALSE" + str(j) + " ")
+                            else:
+                                result_dict[file_name] = result_dict[file_name] + "_UNSUPPORTED"
+                            print("Candidate uses an unsupported construct; stopping this loop.")
+                            break
+
+                        j = j + 1
+                        result_dict[file_name] = result_dict[file_name] + {
+                            'ast': "_AST_FALSE", 'code': "_code_FALSE",
+                            'assert': "_ASSERT_FALSE",
+                        }[stage] + str(j) + " "
+                        if j >= jmax:
+                            break
+
+                        if stage == 'ast':
                             print("AST check FALSE!")
-                            _ASTPrompt = generate_ASTERROR_prompt(_tccode,result, msg)
-                            result, in_tok, out_tok, t_used = call_llm_with_retry(_ASTPrompt)
-                            log_llm_interaction(file_name, _ASTPrompt, result)   # Record log
-                            total_input_tokens += in_tok
-                            total_output_tokens += out_tok
-                            total_analysis_time += t_used
-                            if result == None:
-                                result = ""
-                                break
-                            print("LLM feedback received, waiting for Ultimate verification...")
-                            result = result.replace("```c","")
-                            result = result.replace("```","")
-                            save_string_to_file(result +"\n",result_path + "/" + file_name)
-                        else:
-                            print("AST check OK!")
-                            break
-                    if _bAST == False:
-                            break
-                   # -------------------------------- CODE CHECK --------------------------------
-                    while True:
-                        codeStatus,rank_inf = check_rank_consistency(result)
-                        if codeStatus == 6 or codeStatus == 5:
-                            result_dict[file_name]=result_dict[file_name] +"_LLM_FALSE"+str(j)+" "
-                            break
-                        print("rank_inf:", rank_inf)
-
-                        print("codeStatus:",codeStatus)
-                        if codeStatus != 1:
-                            result_dict[file_name] = result_dict[file_name] + "_code_FALSE"+str(j)+" "
-                            j = j+1
-                            if j >= jmax:
-                                break
-                            if 'errors' in rank_inf:
+                            prompt = generate_ASTERROR_prompt(_tccode, result, payload['msg'])
+                        elif stage == 'code':
+                            status = payload['status']
+                            rank_inf = payload['info']
+                            print("code check FALSE! status:", status)
+                            if isinstance(rank_inf, dict) and 'errors' in rank_inf:
                                 combined_str = '\n'.join(rank_inf['errors'])
-                                
+                            elif isinstance(rank_inf, dict):
+                                combined_str = rank_inf.get('inf', '')
                             else:
-                                combined_str = rank_inf["inf"]  
-                            _codePrompt = generate_code_prompt(_tccode,result,error_information_dict[codeStatus],combined_str)
-                            result, in_tok, out_tok, t_used = call_llm_with_retry(_codePrompt)
-                            log_llm_interaction(file_name, _codePrompt, result)   # Record log
-                            if result == None:
-                                result = ""
-                                break
-                            total_input_tokens += in_tok
-                            total_output_tokens += out_tok
-                            total_analysis_time += t_used
-                            print("code check FALSE!")
-                            
+                                combined_str = str(rank_inf)
+                            prompt = generate_code_prompt(
+                                _tccode, result, error_information_dict[status], combined_str)
                         else:
-                            print("code check OK!")
+                            print("check Ranking function FALSE!")
+                            prompt = generate_RankingFucntion_prompt(_tccode, result, payload['msg'])
+
+                        result, in_tok, out_tok, t_used = call_llm_with_retry(prompt)
+                        log_llm_interaction(file_name, prompt, result)
+                        total_input_tokens += in_tok
+                        total_output_tokens += out_tok
+                        total_analysis_time += t_used
+                        if result is None:
+                            result = ""
                             break
-                    if codeStatus != 1:
+                        print("LLM feedback received, waiting for Ultimate verification...")
+                        result = result.replace("```c","").replace("```","")
+                        save_string_to_file(result +"\n",result_path + "/" + file_name)
+                        continue
+
+                    print("All static checks passed; covering continue statements...")
+                    transformed, cover_msg = cover_continues(result, payload['count'])
+                    if transformed is None:
+                        result_dict[file_name] = result_dict[file_name] + "_UNSUPPORTED"
+                        print("Continue rewrite failed: " + cover_msg)
                         break
-                   # -------------------------------- ASSERT CHECK --------------------------------
-                    bool_CheckRanking, RankingStr = validate_c_file(result)
-                    if bool_CheckRanking == False:
-                        print("check Ranking fucntion False!")
-                        result_dict[file_name] = result_dict[file_name] + "_ASSERT_FALSE"+str(j)+" "
-                        while True:
-                            j = j+1
-                            if j >= jmax:
-                                break
-                            _RankingFucntionPrompt = generate_RankingFucntion_prompt(_tccode,result,RankingStr)
-                            result, in_tok, out_tok, t_used = call_llm_with_retry(_RankingFucntionPrompt)
-                            log_llm_interaction(file_name, _RankingFucntionPrompt, result)   # Record log
-                            total_input_tokens += in_tok
-                            total_output_tokens += out_tok
-                            total_analysis_time += t_used
-                            if result == None:
-                                result = ""
-                            print("LLM feedback received, waiting for Ultimate verification...")
-                            result = result.replace("```c","")
-                            result = result.replace("```","")
-                            bool_CheckRanking, RankingStr = validate_c_file(result)
-                            if bool_CheckRanking == False:
-                                print("check Ranking fucntion still False!")
-                                continue
-                            else:
-                                print("check Ranking fucntion OK!")
-                                break
-                        
-                    else:
-                        print("check Ranking fucntion OK!")
-                    if bool_CheckRanking == False:
+                    if not syntax_ok(transformed):
+                        result_dict[file_name] = result_dict[file_name] + "_UNSUPPORTED"
                         break
-                    result = result.replace("```c","")
-                    result = result.replace("```","")
+                    result = transformed
                     save_string_to_file(result +"\n",result_path + "/" + file_name)
                     save_string_to_file(result +"\n",result_path + "/" + file_name.replace(".c","_"+str(j)+"_.c"))
                    # -------------------------------- UAutomizer CHECK --------------------------------
                     ultimate_result,ultimate_time  = run_termination_command(result_path + "/" + file_name,file_name.replace(".c",""),ultimate_dir)
-                    total_analysis_time += ultimate_time   
+                    total_analysis_time += ultimate_time
                     if ultimate_result == False:
                         import subprocess
                         subprocess.run(["pkill", "z3"])
-                        result_dict[file_name]=result_dict[file_name] +"_TIMELIMIT_FALSE"
-                        print("Analysis failed: timeout. Results saved.")
-                        break
+                        j = j + 1
+                        result_dict[file_name] = (result_dict[file_name]
+                                                  + "_TIMELIMIT_FALSE" + str(j) + " ")
+                        if j >= jmax:
+                            print("Analysis failed: timeout and no iteration left.")
+                            break
+                        print("Ultimate timed out; restarting with a fresh initial query "
+                              "(iteration %d/%d)." % (j, counter_max))
+                        initial_prompt = generate_c_termination_initial(_tccode, file_name)
+                        result, in_tok, out_tok, t_used = call_llm_with_retry(initial_prompt)
+                        log_llm_interaction(file_name, initial_prompt, result)
+                        total_input_tokens += in_tok
+                        total_output_tokens += out_tok
+                        total_analysis_time += t_used
+                        if result is None:
+                            result = ""
+                            break
+                        result = result.replace("```c", "").replace("```", "")
+                        save_string_to_file(result + "\n", result_path + "/" + file_name)
+                        continue
                     with open(result_path + "/" + file_name.replace(".c","")+".c", "r") as f:
                         llvm_c = f.read()
                     with open(result_path + "/" + file_name.replace(".c","")+".txt", "r") as f:
@@ -488,7 +762,7 @@ def main():
     parser.add_argument('--iterate-max', type=int, default=1, help='Maximum number of iterations')
     parser.add_argument('--data-path', type=str, default=1, help='Path to input data')
     parser.add_argument('--result-path', type=str, default=1, help='Path to output results')
-    parser.add_argument('--platform', type=str, default=1, help='LLM platform (deepseek, aliyun, openrouter)')
+    parser.add_argument('--platform', type=str, default=1, help='LLM platform (deepseek, aliyun, openrouter, oxoai)')
     parser.add_argument('--model', type=str, default=1, help='LLM model name')
     parser.add_argument('--ultimate-dir', type=str, required=True, 
                         help='Path to Ultimate tool directory, e.g., /workspace/UAutomizer-linux')
@@ -501,8 +775,8 @@ def main():
     print('Platform: ' + str(args.platform))
     print('Model: ' + args.model)
     platform = args.platform
-    if args.platform not in ['deepseek', 'aliyun', 'openrouter']:
-        print("Invalid platform. Choose one of: 'deepseek', 'aliyun', 'openrouter'")
+    if args.platform not in ['deepseek', 'aliyun', 'openrouter', 'oxoai']:
+        print("Invalid platform. Choose one of: 'deepseek', 'aliyun', 'openrouter', 'oxoai'")
         return
     with open('api_keys.json', 'r') as f:
         api_config = json.load(f)

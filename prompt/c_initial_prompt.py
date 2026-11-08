@@ -22,24 +22,25 @@ I will provide you with several examples.
     #include <stdlib.h>
     extern int __VERIFIER_nondet_int(void);
     int main() {
-        int x, y;
-        x = __VERIFIER_nondet_int();
-        y = __VERIFIER_nondet_int();
+        int pos = __VERIFIER_nondet_int();
+        int bound = __VERIFIER_nondet_int();
+        if (pos < 0 || bound < 0) {
+            return 0;
+        }
 
         int old_rank1;
-        int new_rank1 = (x + y > 0) ? ( (x < 0) ? (y - x) : (x + 1) ) : 0;
+        int new_rank1 = bound - pos;
 
-        while (x + y > 0) {
+        while (pos < bound) {
 
             old_rank1 = new_rank1;
-            
-            x = x - 1;
-            y = -2*y;
 
-            new_rank1 = (x + y > 0) ? ( (x < 0) ? (y - x) : (x + 1) ) : 0;
+            pos = pos + 1;
+
+            new_rank1 = bound - pos;
 
             //@ assert(old_rank1 > new_rank1 && old_rank1 >= 0);
-            //@ assert(new_rank1 >= 0 || !(x+y > 0));
+            //@ assert(new_rank1 >= 0 || !(pos < bound));
         }
         return 0;
     }
@@ -50,30 +51,33 @@ I will provide you with several examples.
     extern int __VERIFIER_nondet_int(void);
 
     int main() {
-        int x = __VERIFIER_nondet_int();
-        int y = __VERIFIER_nondet_int();
-        int c1 = 0;
-        int c2 = 0;
+        int i = __VERIFIER_nondet_int();
+        int j = __VERIFIER_nondet_int();
+        if (i < 0 || j < 0) {
+            return 0;
+        }
 
         int old_rank1, old_rank2;
-        int new_rank1 = x - y;                      
-        int new_rank2 = (c1 == 0 && c2 == 0) ? 2 : 1; 
+        int new_rank1 = i;
+        int new_rank2 = j;
 
-        while (x > y) {
+        while (i > 0) {
 
             old_rank1 = new_rank1;
             old_rank2 = new_rank2;
 
-            x = x + c1 / 3;
-            y = y + c2 / 2;
-            c1 = c1 + 2;
-            c2 = c2 + 3;
+            if (j > 0) {
+                j = j - 1;
+            } else {
+                i = i - 1;
+                j = i;
+            }
 
-            new_rank1 = x - y;
-            new_rank2 = (c1 == 0 && c2 == 0) ? 2 : 1;
+            new_rank1 = i;
+            new_rank2 = j;
 
             //@ assert(((old_rank1 > new_rank1) || (old_rank1 == new_rank1 && old_rank2 > new_rank2)) && old_rank1 >= 0  && old_rank2 >= 0);
-            //@ assert((new_rank1 >= 0  && new_rank2 >= 0) || !(x > y));
+            //@ assert((new_rank1 >= 0  && new_rank2 >= 0) || !(i > 0));
         }
         return 0;
     }
