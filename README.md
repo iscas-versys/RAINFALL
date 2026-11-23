@@ -10,11 +10,11 @@ This guide covers how to set up the required environment for RAINFALL.
 | **System**             | bash, cmake, make, gcc, git, wget, tar, xz-utils, libboost-all-dev                              |
 | **LLVM toolchain**     | LLVM + Clang **12.0.1** – pre‑built archive provided by RAINFALL                                |
 | **Custom tools**       | `veri-clang` & `veri-llvm-pass.so` – built from RAINFALL source                                 |
-| **Python**             | Python 3.9+ (3.12 recommended) with `venv`                                                      |
+| **Python**             | Python 3.9+ (3.10 recommended, tested) with `venv`                                              |
 | **Python packages**    | `requests`, `pycparser`, `clang==12.0.1` (Python bindings)                                     |
 | **Ultimate Automizer** | Java 11+ (tested with OpenJDK 21), `wget`, `unzip`                                              |
 | **Optional**           | `g++` – removes CDT “Cannot run program g++” warnings (not required for verification)           |
-| **Environment**        | `PATH` must include `$ULTIMATE_DIR/adds`; `LLVM_COMPILER`, `VERI_LIB_PATH` (set by scripts)     |
+| **Environment**        | `PATH` must include `$ULTIMATE_DIR` (where `z3` and `Ultimate` are located); `LLVM_COMPILER`, `VERI_LIB_PATH` (set by scripts) |
 
 
 ---
@@ -201,10 +201,10 @@ EOF
 # 11. INSTALL UAutomizer
 apt-get update
 apt-get install -y openjdk-21-jre wget unzip g++
-cd Your_Project_Path
+mkdir -p /app && cd /app
 wget https://github.com/ultimate-pa/ultimate/releases/download/v0.3.1/UltimateAutomizer-linux.zip
 unzip UltimateAutomizer-linux.zip
 export PATH=/app/UAutomizer-linux/:$PATH
 
 # 12. Run the termination analysis
-python main.py     --llm-max 1 --iterate-max 5     --data-path="./data/eight_channel_data/eight_freqterm_process_data/data8/"     --result-path="./termination_result1"     --platform=deepseek     --model=deepseek-v4-pro    --ultimate-dir=/app/UAutomizer-linux
+python main.py     --llm-max 1 --iterate-max 5     --data-path="./data/eight_channel_data/eight_freqterm_process_data/data8/"     --result-path="./termination_result1"     --platform=deepseek     --model=deepseek-flash    --ultimate-dir=/app/UAutomizer-linux
