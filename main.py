@@ -421,6 +421,14 @@ def syntax_ok(text):
         return False
 
 
+def is_toolchain_failure(ultimate_answer):
+    markers = (
+        'Cannot run program "z3"',
+        "Unable to construct solver",
+    )
+    return any(marker in ultimate_answer for marker in markers)
+
+
 def process_c_files(folder_path, llm_max, counter_max,output_dir="termination_results", ultimate_dir='/workspace/UltimateAutomizer-linux/UAutomizer-linux'):
     """
     Process all C files in a folder and save analysis results.
@@ -438,7 +446,7 @@ def process_c_files(folder_path, llm_max, counter_max,output_dir="termination_re
     for i, file_path in enumerate(c_files):
         file_name = os.path.basename(file_path)
         result_dict.setdefault(file_name, "FALSE")
-        print(f"Analysis completed for {i} files. {true_cnt} programs proved to terminate.")
+        print(f"Progress: {i}/{len(c_files)} files processed, {true_cnt} proved to terminate.")
         print(f"Processing ({i+1}/{len(c_files)}): {file_name}")
         final_result = "FALSE"
         total_input_tokens = 0
@@ -452,7 +460,10 @@ def process_c_files(folder_path, llm_max, counter_max,output_dir="termination_re
         _TAG = 0
         _tLoopList = FindLoopLine(data_path + "/" + file_name,SpecDictList)
         print("Analyzing loops:", _tLoopList)
+        toolchain_failed = False
         for _tLoop in _tLoopList:
+            if toolchain_failed:
+                break
             analyze_finish = 0
             llm_stage = 0
             while llm_stage < llm_max:
@@ -558,8 +569,6 @@ def process_c_files(folder_path, llm_max, counter_max,output_dir="termination_re
                     ultimate_result,ultimate_time  = run_termination_command(result_path + "/" + file_name,file_name.replace(".c",""),ultimate_dir)
                     total_analysis_time += ultimate_time
                     if ultimate_result == False:
-                        import subprocess
-                        subprocess.run(["pkill", "z3"])
                         j = j + 1
                         result_dict[file_name] = (result_dict[file_name]
                                                   + "_TIMELIMIT_FALSE" + str(j) + " ")
@@ -591,7 +600,16 @@ def process_c_files(folder_path, llm_max, counter_max,output_dir="termination_re
                             print("Analysis succeeded: program terminates. Results saved.")
                             
                             analyze_finish = 1
-                            break                    
+                            break
+                    if is_toolchain_failure(ultimate_answer):
+                        final_result = "TOOLCHAIN_ERROR"
+                        result_dict[file_name] = result_dict[file_name] + "_TOOLCHAIN_ERROR"
+                        toolchain_failed = True
+                        analyze_finish = 1
+                        print("Ultimate toolchain failure (e.g. z3 not found). Make sure %s is on PATH, "
+                              "e.g. export PATH=%s:$PATH. Skipping remaining iterations for this file."
+                              % (ultimate_dir, ultimate_dir))
+                        break
                     j = j+1
                     if j >= jmax:
                         break

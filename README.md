@@ -70,29 +70,31 @@ The artifact is shipped as a portable Docker image (`rainfall-artifact.tar`) tha
 ```bash
 docker load -i rainfall-artifact.tar
 ```
-After loading, you should see the image `rainfall-artifact:v1` listed.
+After loading, you should see the image `rainfall-artifact:v2` listed.
 Verify with:
 ```bash
 docker images | grep rainfall-artifact
+sha256sum rainfall-artifact.tar   # 03cc4208c5cb29caea3b82d40149561d99ac2432f406d5b745da70e9e561ec54
 ```
 
 ### Step 2: Run a Container from the Image
 ```bash
-docker run -it --name rainfall rainfall-artifact:v1
+docker run -it --name rainfall rainfall-artifact:v2
 ```
 This will drop you into the container’s bash shell. All project files are located under `/artifact`.  
 By default, the working directory is `/artifact/RAINFALL`.
 
 > **Note**: If you need to run the container again after exiting, use `docker start -ai rainfall`.
 
-### Step 3: Activate the Python Virtual Environment
-Inside the container:
+### Step 3: Set Up the LLVM Environment
+The Python virtual environment (`rainfall_env`) and the Ultimate Automizer directory are already on `PATH` in this image, so `python`, `z3`, and `Ultimate` are found automatically. Only the LLVM-related variables need to be initialized. Inside the container:
 ```bash
-source /artifact/RAINFALL/rainfall_env/bin/activate
 source ./scripts/requires/init_env.sh
 ```
+Answer `Y` when it asks whether `/artifact/RAINFALL` is the tool root directory.
 
-### Step 4: Set Up the PATH for Ultimate Automizer
+### Step 4: PATH for Ultimate Automizer (already configured)
+This step is only needed for older images (v1). For `rainfall-artifact:v2`, nothing has to be done; if you ever miss `z3`, run:
 ```bash
 export PATH=/artifact/UAutomizer-linux/:$PATH
 ```
