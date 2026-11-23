@@ -133,7 +133,7 @@ python main.py \
     --data-path="./example/input/" \
     --result-path="./termination_result_example" \
     --platform=deepseek \
-    --model=deepseek-v4-pro \
+    --model=deepseek-flash \
     --ultimate-dir=/artifact/UAutomizer-linux
 ```
 This will run the termination analysis on the small example (a bounded loop program).
@@ -207,4 +207,4 @@ unzip UltimateAutomizer-linux.zip
 export PATH=/app/UAutomizer-linux/:$PATH
 
 # 12. Run the termination analysis
-python main.py     --llm-max 2 --iterate-max 5     --data-path="./data/eight_channel_data/eight_freqterm_process_data/data8/"     --result-path="./termination_result1"     --platform=deepseek     --model=deepseek-v4-pro    --ultimate-dir=/app/UAutomizer-linux
+python main.py     --llm-max 1 --iterate-max 5     --data-path="./data/eight_channel_data/eight_freqterm_process_data/data8/"     --result-path="./termination_result1"     --platform=deepseek     --model=deepseek-v4-pro    --ultimate-dir=/app/UAutomizer-linux
