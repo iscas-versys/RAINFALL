@@ -60,7 +60,7 @@ RAINFALL/
 └── static_check/                   # Custom static checkers / analyser configurations
 ```
 ## Quick Start
-We also provide a complete artifact at https://drive.google.com/file/d/1wGA65tRZ-Nt9zGGPqFWSxWH-HsmgddDr/view?usp=drive_link (SHA256:1b79f0e6de9fbe122bbdf9d454b8f6bd5efa7b8c1fb40eeccf07ab91b8e617c4), which includes a full Docker environment and installation/usage steps. 
+We also provide a complete artifact at TBD, which includes a full Docker environment and installation/usage steps. 
 
 ## How to Run Using the Pre-built Docker Image
 
